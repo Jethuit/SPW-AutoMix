@@ -1,0 +1,22 @@
+{
+  "configs": [{
+    "title": "AutoMix 双轨过渡",
+    "config": "settings.json",
+    "preferences": [
+      {
+        "type": "button",
+        "title": "打开 AutoMix",
+        "summary": "在主界面打开 AutoMix 独立过渡编辑页，也可直接点击左侧栏「AutoMix」进入。",
+        "arrow_type": "arrow",
+        "on_click": "automix.MainPlugin.openPage"
+      },
+      {
+        "type": "button",
+        "title": "播放接入状态",
+        "summary": "需在 SPW 播放设置中开启智能过渡（AutoMix），切歌时自动接管生效。",
+        "arrow_type": "none",
+        "on_click": "automix.MainPlugin.showStatus"
+      }
+    ]
+  }]
+}
