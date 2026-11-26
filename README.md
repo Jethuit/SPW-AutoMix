@@ -33,3 +33,9 @@ AutoMix 是 Salt Player for Windows 的歌曲转场插件。它会分析本地�
 首次完整分析支持最多 15 分钟的音频。扫描时会跳过超限曲目，后续可复用有效的分析缓存。
 
 [详细使用说明](plugin/README.md) · [v0.1.0 发布说明](docs/releases/v0.1.0.md)
+
+## 许可证
+
+- AutoMix 自有代码采用 [MIT 许可证](LICENSE)。
+- 第三方代码保留各自的许可声明。 [SPW Listen Stats](plugin/resources/META-INF/LICENSE-SPW-Listen-Stats) · [SPW-Lyrics](plugin/resources/META-INF/LICENSE-SPW-Lyrics) · [Compose 索引工具](tools/LICENSE-RestoreComposeIndex)
+- 离线包内的 FFmpeg 在独立进程中运行，随包附有 GPLv3 许可和构建说明。 [FFmpeg 构建](https://github.com/GyanD/codexffmpeg/releases/tag/9.0.2) · [FFmpeg 源码](https://github.com/FFmpeg/FFmpeg/tree/946fcce07b)

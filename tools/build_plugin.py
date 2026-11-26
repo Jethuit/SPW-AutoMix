@@ -43,6 +43,7 @@ def main():
                         "-opt-in=com.xuncorp.spw.workshop.api.UnstableSpwWorkshopApi", "-no-stdlib", "-classpath", cp, f"-Xplugin={kotlin / 'compose-compiler-plugin.jar'}",
                         "-jvm-target", "25", "-d", str(classes), *map(str, sorted((ROOT / "plugin/src").glob("*.kt")))], check=True)
         shutil.copytree(ROOT / "plugin/resources", classes, dirs_exist_ok=True)
+        shutil.copyfile(ROOT / "LICENSE", classes / "META-INF/LICENSE-AutoMix")
         if args.system_runtime:
             (classes / "automix-system-runtime").write_text("system\n", encoding="ascii")
         else:
