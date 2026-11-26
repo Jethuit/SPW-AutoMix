@@ -1,19 +1,19 @@
 # SPW AutoMix
 
-SPW AutoMix 是面向 Salt Player for Windows 的转场插件。它分析本地音频，推荐切点和混音方案，并提供双轨波形编辑器供试听和调整。
+Salt Player for Windows 的歌曲转场插件。自动推荐切点，也可以在双轨波形上编辑和试听。
 
-## 安装
+**[下载 v0.1.0 安装包](https://github.com/Jethuit/SPW-AutoMix/releases/download/v0.1.0/SPW-AutoMix-v0.1.0.spmod)** · Windows x64 · 已验证 SPW 1.19.3 · 内置 FFmpeg
 
-从 GitHub Releases 下载 `SPW-AutoMix-v0.1.0.spmod`。正式包内置 FFmpeg，支持离线分析和试听。兼容性检查使用 Windows x64 上的 SPW 1.19.3。 [GitHub Releases](https://github.com/Jethuit/SPW-AutoMix/releases)
+## 快速开始
 
-1. 在 SPW 创意工坊导入安装包，授予曲库读取和类变换权限，再启用插件。
-2. 从左侧导航栏打开 **AutoMix**。双击右侧歌曲可以直接播放，点击歌曲间的转场可以编辑和试听。
-3. 如需让方案在日常播放中自动应用，在 SPW 播放设置中开启 **智能过渡**。已保存的曲对设置优先。
+1. **安装** 在 SPW 创意工坊导入 `.spmod`，授予曲库读取和类变换权限，再启用插件。
+2. **编辑** 在左侧打开「AutoMix」，点击两首歌之间的转场，调整后即可试听和保存。
+3. **播放** 在 SPW 播放设置中开启「智能过渡」，切歌时会优先应用已保存的方案。
 
-## 功能
+## 主要功能
 
-- 双轨波形、拍点和强拍、BPM、调名、Camelot 编号及响度。
-- 原速转场推荐、拍点磁吸、自定义音量和效果曲线，以及响度匹配试听。
-- 浏览和调整播放队列与歌单，扫描分析结果或生成新的混音歌单。
+- **分析** 查看拍点、强拍、BPM 和 Camelot 调号。
+- **混音** 原速对拍、拍点磁吸、响度匹配试听，以及音量和效果曲线。
+- **歌单** 双击播放、拖动排序，可仅扫描或生成混音歌单。
 
-操作说明和本版注意事项见 [插件文档](plugin/README.md)及 [v0.1.0 发布说明](docs/releases/v0.1.0.md)。
+[使用说明](plugin/README.md) · [所有版本](https://github.com/Jethuit/SPW-AutoMix/releases)
