@@ -2,28 +2,82 @@ package automix
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
-import kotlinx.serialization.json.*
 import java.io.ByteArrayInputStream
-import java.nio.file.Files
+import java.io.IOException
 import java.nio.file.Path
+import java.util.concurrent.locks.ReentrantLock
 import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.Clip
 import javax.sound.sampled.LineEvent
+import kotlin.math.roundToInt
+
+internal data class TrackAnalysisMetadata(val bpm: Double?, val keyName: String?, val camelot: String?) {
+    val keyLabel: String? get() = if (keyName != null && camelot != null) "$keyName · $camelot" else null
+
+    val bpmLabel: String? get() = bpm?.let { "${formatBpm(it)} BPM" }
+
+    fun tempoPair(other: TrackAnalysisMetadata): String? {
+        val from = bpm ?: return null
+        val to = other.bpm ?: return null
+        return "${formatBpm(from)} → ${formatBpm(to)} BPM"
+    }
+
+    companion object {
+        private fun formatBpm(value: Double): String {
+            val tenths = (value * 10).roundToInt()
+            return if (tenths % 10 == 0) (tenths / 10).toString() else "${tenths / 10}.${tenths % 10}"
+        }
+    }
+}
+
+internal data class PlaylistScanResult(val analyzed: Int, val firstTrackError: String?)
+
+internal data class PlaylistSequenceResult(
+    val matched: List<Int>,
+    val all: List<Int>,
+    val analyzed: Int,
+    val weakLinks: Int
+)
+
+internal data class PairAnalysis(val a: DspTrack, val b: DspTrack, val recommendation: DspRecommendation)
 
 internal class Worker(
     private val cache: Path,
     private val autoPauseHost: () -> Unit = {}
 ) {
-    private val active = mutableSetOf<Process>()
+    private val requests = ReentrantLock()
+    private var activeThread: Thread? = null
     private var clip: Clip? = null
     private var closed = false
     private var hostPlaying: Boolean? = null
     private var audition = 0L
+    private val ffmpeg by lazy {
+        if (Worker::class.java.getResource("/automix-system-runtime") != null) {
+            System.getenv("AUTOMIX_FFMPEG")?.takeIf { it.isNotBlank() } ?: "ffmpeg"
+        } else {
+            PortableRuntime.prepare(cache.resolveSibling("runtime")).resolve("ffmpeg.exe").toString()
+        }
+    }
+    private val tracks = DspTrackCache(cache) { ffmpeg }
 
     private data class PreviewKey(val a: String, val b: String, val plan: Plan, val window: TransitionWindow)
 
     private var cachedKey: PreviewKey? = null
     private var cachedWav: ByteArray? = null
+
+    private fun <T> process(action: () -> T): T {
+        requests.lockInterruptibly()
+        try {
+            synchronized(this) {
+                check(!closed) { "插件已停用" }
+                activeThread = Thread.currentThread()
+            }
+            return action()
+        } finally {
+            synchronized(this) { activeThread = null }
+            requests.unlock()
+        }
+    }
 
     @Synchronized fun playingChanged(playing: Boolean) {
         hostPlaying = playing
@@ -70,7 +124,8 @@ internal class Worker(
                 }
             }
             position()?.let { next.seekTo(it) }
-            if (hostPlaying == true) autoPauseHost()
+            // A plugin enabled during playback may not have received an initial playback event yet.
+            if (hostPlaying != false) autoPauseHost()
             clip = next
             next.start()
             cachedKey = key
@@ -82,108 +137,86 @@ internal class Worker(
         }
     }
 
-    suspend fun loadPlaylists(): JsonObject = runInterruptible(Dispatchers.IO) {
-        synchronized(this) { check(!closed) { "插件已停用" } }
-        val dir = Files.createTempDirectory("spw-automix-pl-")
-        val script = dir.resolve("worker.pyz")
-        val out = dir.resolve("result.json")
-        val err = dir.resolve("worker.log")
-        try {
-            Worker::class.java.getResourceAsStream("/automix-worker.pyz")!!.use { Files.copy(it, script) }
-            val process = synchronized(this) {
-                check(!closed) { "插件已停用" }
-                ProcessBuilder("py", "-3", "-X", "utf8", script.toString())
-                    .redirectOutput(out.toFile()).redirectError(err.toFile()).start().also { active.add(it) }
-            }
-            try {
-                process.outputStream.bufferedWriter(Charsets.UTF_8).use {
-                    it.write(buildJsonObject { put("op", "playlists") }.toString())
-                }
-                check(process.waitFor() == 0) {
-                    Files.readAllLines(err).lastOrNull()?.take(200) ?: "读取歌单失败"
-                }
-                Json.parseToJsonElement(Files.readString(out)).jsonObject
-            } finally {
-                terminate(process)
-                synchronized(this) { active.remove(process) }
-            }
-        } finally {
-            listOf(out, err, script, dir).forEach { runCatching { Files.deleteIfExists(it) } }
+    suspend fun planPair(a: String, b: String): Plan = runInterruptible(Dispatchers.IO) {
+        process { recommend(tracks.profile(a), tracks.profile(b)).plan }
+    }
+
+    suspend fun analyzePair(a: String, b: String): PairAnalysis = runInterruptible(Dispatchers.IO) {
+        process {
+            val first = tracks.track(a)
+            val second = tracks.track(b)
+            PairAnalysis(first, second, recommend(first.profile, second.profile))
         }
     }
 
-    suspend fun job(
+    private fun recommend(a: DspProfile, b: DspProfile) = DspPlanning.transition(a, b).also {
+        check(it.plan.valid()) { "自动过渡参数无效" }
+    }
+
+    suspend fun scanPlaylist(paths: List<String?>, onProgress: (Int) -> Unit): PlaylistScanResult {
+        var firstError: String? = null
+        var analyzed = 0
+        for ((index, path) in paths.withIndex()) {
+            if (path != null) {
+                try {
+                    runInterruptible(Dispatchers.IO) { process { tracks.profile(path) } }
+                    analyzed++
+                } catch (e: IOException) {
+                    if (firstError == null) firstError = e.message ?: "音频解码失败"
+                } catch (e: IllegalArgumentException) {
+                    if (firstError == null) firstError = e.message ?: "音频分析失败"
+                }
+            }
+            onProgress(index + 1)
+        }
+        return PlaylistScanResult(analyzed, firstError)
+    }
+
+    suspend fun sequencePlaylist(paths: List<String?>): PlaylistSequenceResult {
+        val result = runInterruptible(Dispatchers.IO) {
+            process { DspPlanning.sequence(paths.map { it?.let(tracks::cachedProfile) }) }
+        }
+        check(result.all.size == paths.size && result.all.toSet() == paths.indices.toSet() &&
+            result.matched.distinct().size == result.matched.size &&
+            result.matched.all { it in paths.indices }) { "歌单排序结果无效" }
+        return result
+    }
+
+    suspend fun cachedTrackMetadata(paths: List<String>): Map<String, TrackAnalysisMetadata> = runInterruptible(Dispatchers.IO) {
+        paths.mapNotNull { path ->
+            if (Thread.interrupted()) throw InterruptedException()
+            tracks.cachedProfile(path)?.let { path to TrackAnalysisMetadata(it.bpm, it.keyName, it.camelot) }
+        }.toMap()
+    }
+
+    suspend fun preview(
         a: String,
         b: String,
-        plan: Plan? = null,
-        window: TransitionWindow? = null,
+        plan: Plan,
+        window: TransitionWindow,
         position: () -> Double? = { null }
-    ): JsonObject = runInterruptible(Dispatchers.IO) {
-        val key = plan?.let { PreviewKey(a, b, it, requireNotNull(window)) }
+    ) = runInterruptible(Dispatchers.IO) {
+        val key = PreviewKey(a, b, plan, window)
         val (ticket, hitBytes) = synchronized(this) {
             check(!closed) { "插件已停用" }
-            audition to cachedWav?.takeIf { key != null && cachedKey == key }
+            audition to cachedWav?.takeIf { cachedKey == key }
         }
 
-        if (key != null && hitBytes != null) {
-            listen(hitBytes, key, ticket, position)
-            return@runInterruptible buildJsonObject { put("cached", true) }
+        val wav = hitBytes ?: process {
+            synchronized(this) { check(audition == ticket) { "试听已取消" } }
+            val first = tracks.profile(a)
+            val second = tracks.profile(b)
+            DspPreview.render(a, b, second.duration, plan, window, ffmpeg, lufsA = first.lufs, lufsB = second.lufs)
         }
-
-        val dir = Files.createTempDirectory("spw-automix-")
-        val script = dir.resolve("worker.pyz")
-        val out = dir.resolve("result.json")
-        val err = dir.resolve("worker.log")
-        val wav = dir.resolve("preview.wav")
-        try {
-            Worker::class.java.getResourceAsStream("/automix-worker.pyz")!!.use { Files.copy(it, script) }
-            val process = synchronized(this) {
-                check(!closed) { "插件已停用" }
-                ProcessBuilder("py", "-3", "-X", "utf8", script.toString())
-                    .redirectOutput(out.toFile()).redirectError(err.toFile()).start().also { active.add(it) }
-            }
-            try {
-                process.outputStream.bufferedWriter(Charsets.UTF_8).use {
-                    it.write(buildJsonObject {
-                        put("a", a); put("b", b); put("op", if (key == null) "analyze" else "preview")
-                        put("cache", cache.toString())
-                        if (key != null) {
-                            put("plan", key.plan.json())
-                            put("window", key.window.json(key.plan))
-                            put("output", wav.toString())
-                        }
-                    }.toString())
-                }
-                check(process.waitFor() == 0) {
-                    Files.readAllLines(err).lastOrNull()?.take(200) ?: "音频处理失败"
-                }
-                val resJson = Json.parseToJsonElement(Files.readString(out)).jsonObject
-                if (key != null) {
-                    if (Thread.interrupted()) throw InterruptedException()
-                    listen(Files.readAllBytes(wav), key, ticket, position)
-                }
-                resJson
-            } finally {
-                terminate(process)
-                synchronized(this) { active.remove(process) }
-            }
-        } finally {
-            listOf(wav, out, err, script, dir).forEach { runCatching { Files.deleteIfExists(it) } }
-        }
-    }
-
-    private fun terminate(process: Process) {
-        if (process.isAlive) {
-            process.descendants().use { children -> children.forEach { it.destroyForcibly() } }
-            process.destroyForcibly()
-        }
+        if (Thread.interrupted()) throw InterruptedException()
+        listen(wav, key, ticket, position)
     }
 
     @Synchronized fun stop() {
         closed = true
+        activeThread?.interrupt()
         cachedWav = null
         cachedKey = null
         stopPreview()
-        active.forEach(::terminate)
     }
 }

@@ -33,8 +33,10 @@ import com.xuncorp.spw.workshop.api.hook.ComposableHook
 import com.xuncorp.spw.workshop.api.hook.MethodHook
 import com.xuncorp.spw.workshop.api.hook.MethodHookParam
 import com.xuncorp.spw.workshop.api.hook.UiHookCall
+import java.lang.ref.WeakReference
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier as JModifier
+import javax.swing.UIManager
 
 /** Host-composed standalone AutoMix page and navigation coordinator. */
 internal object AutoMixNav {
@@ -44,14 +46,14 @@ internal object AutoMixNav {
         val navigate: (Any) -> Unit,
         val hasHostOverlay: () -> Boolean
     )
+    private class OpenRequest(val host: Binding, val route: Any, val marker: Any)
 
     var visible by mutableStateOf(false)
         private set
 
     private var binding: Binding? = null
-    @Volatile private var pendingMarker: Any? = null
-
-    val boundNavigator: Any? get() = binding?.navigator
+    private var pending: OpenRequest? = null
+    private val issuedMarkers = mutableListOf<WeakReference<Any>>()
 
     fun bindNavigator(
         navigator: Any,
@@ -61,20 +63,17 @@ internal object AutoMixNav {
     ): AutoCloseable {
         val b = Binding(navigator, currentRoute, navigate, hasHostOverlay)
         binding = b
+        pending = null
         return AutoCloseable {
             if (binding === b) {
                 binding = null
-                pendingMarker = null
+                pending = null
             }
         }
     }
 
-    fun open() {
-        visible = true
-    }
-
     fun close() {
-        pendingMarker = null
+        pending = null
         visible = false
     }
 
@@ -87,31 +86,41 @@ internal object AutoMixNav {
         }
         try {
             val route = host.currentRoute()
-            if (route != null) {
-                val marker = copyHostRoute(route)
-                pendingMarker = marker
-                host.navigate(marker)
-            } else {
-                open()
+            if (route == null) {
+                visible = true
+                return
             }
-        } catch (_: Throwable) {
-            pendingMarker = null
-            open()
+            val marker = copyHostRoute(route)
+            issuedMarkers.removeAll { it.get() == null }
+            issuedMarkers += WeakReference(marker)
+            pending = OpenRequest(host, route, marker)
+            host.navigate(marker)
+        } catch (_: Exception) {
+            pending = null
+            WorkshopApi.ui.toast("无法切换到 AutoMix", WorkshopApi.Ui.ToastType.Warning)
         }
     }
 
-    fun consumeIfPending(arg: Any?): Boolean {
-        val marker = pendingMarker ?: return false
-        if (arg !== marker) return false
-        pendingMarker = null
-        open()
-        return true
+    private fun OpenRequest.matches(navigator: Any?, arg: Any?): Boolean =
+        marker === arg && host === binding && host.navigator === navigator && host.currentRoute() === route
+
+    fun beforeNavigation(navigator: Any?, destination: Any?, isNavigate: Boolean): Boolean {
+        if (isNavigate && destination != null && issuedMarkers.any { it.get() === destination }) {
+            val request = pending
+            if (request?.matches(navigator, destination) == true) return false
+            // Another plugin can replay a canceled request after an asynchronous leave guard.
+            if (request?.marker === destination) pending = null
+            return true
+        }
+        if (navigator != null && navigator === binding?.navigator) close()
+        return false
     }
 
-    fun onExternalNavigation(arg: Any?) {
-        val marker = pendingMarker
-        if (marker != null && arg === marker) return
-        close()
+    fun afterNavigate(navigator: Any?, destination: Any?) {
+        val request = pending ?: return
+        if (!request.matches(navigator, destination)) return
+        pending = null
+        visible = true
     }
 
     fun consumeBack(navigator: Any): Boolean {
@@ -133,8 +142,23 @@ internal object AutoMixNav {
         } else {
             type.getDeclaredConstructor().apply { trySetAccessible() }.newInstance()
         }
-        check(result !== route && result == route) { "Route copy mismatch" }
+        check(result !== route && result == route && route == result) { "Route copy mismatch" }
         return result
+    }
+}
+
+internal class AutoMixNavigationHook(private val isNavigate: Boolean, private val isActive: () -> Boolean) : MethodHook(90) {
+    override fun before(call: MethodHookParam) {
+        if (isActive() && AutoMixNav.beforeNavigation(call.thisObject, call.args.firstOrNull(), isNavigate)) {
+            call.setResult(null)
+        }
+    }
+
+    override fun after(call: MethodHookParam) {
+        // The host returns early for this equal route. Other plugins still see an accepted call.
+        if (isNavigate && isActive() && !call.isOriginalSkipped && call.throwable == null) {
+            AutoMixNav.afterNavigate(call.thisObject, call.args.firstOrNull())
+        }
     }
 }
 
@@ -147,12 +171,14 @@ private class SidebarStyleMasker(control: Method) {
             !it.returnType.isPrimitive
     }.returnType
 
-    @Suppress("UNCHECKED_CAST")
-    val local: ProvidableCompositionLocal<Any?> = owner.declaredMethods.single {
+    private val localGetter = owner.declaredMethods.single {
         JModifier.isStatic(it.modifiers) &&
             it.parameterCount == 0 &&
             it.returnType == ProvidableCompositionLocal::class.java
-    }.invoke(null) as ProvidableCompositionLocal<Any?>
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    val local: ProvidableCompositionLocal<Any?> get() = localGetter.invoke(null) as ProvidableCompositionLocal<Any?>
 
     private val constructor = styleType.declaredConstructors.single {
         val p = it.parameterTypes
@@ -201,158 +227,117 @@ private class SidebarStyleMasker(control: Method) {
     }
 }
 
-/** Verified SPW 1.19.3 sidebar and navigation hooks (uses afterComposable to coexist with other plugins). */
-internal class SidebarBridge(loader: ClassLoader) {
-    private val sidebarItemClass = "androidx.compose.ui.غ\$Ԫ"
-    private val routeGetter = Class.forName(sidebarItemClass, false, loader).getMethod("Ԩ")
-    val sidebarControl = Class.forName("androidx.compose.ui.ӌ", false, loader).declaredMethods.single {
-        it.name == "Ϳ" && it.parameterCount == 11
+/** Keep the overlay and sidebar scoped to the discovered host call sites. */
+internal class SidebarBridge(symbols: HostSymbols) {
+    private val navigation = HostNavigationTargets(symbols)
+    val backdrop = runCatching { HostBackdrop(symbols, navigation.contentLayout(symbols)) }.getOrNull()
+    private val sidebar = runCatching { HostSidebarTargets(symbols) }
+    private val styleMasker = runCatching { SidebarStyleMasker(sidebar.getOrThrow().control) }.getOrNull()
+    private val theme = runCatching { HostSkin(symbols) }.getOrNull()
+    var sidebarWarning = sidebar.exceptionOrNull()?.let { it.message ?: it.javaClass.simpleName }
+        private set
+
+    val localNavigator get() = navigation.localNavigator
+
+    fun skin(composer: Composer): Skin {
+        val base = runCatching { theme?.read(composer) }.getOrNull() ?: fallbackSkin(
+            UIManager.getColor("Panel.background")?.let { it.red + it.green + it.blue < 384 } ?: false
+        )
+        return materialSkin(base, backdrop?.activeBackdrop ?: WindowBackdrop.Solid)
     }
-    private val routeAccessor = Class.forName("androidx.compose.ui.ଚ", false, loader).declaredMethods.single {
-        JModifier.isStatic(it.modifiers) && it.name == "Ϳ" &&
-            it.parameterCount == 3 && it.parameterTypes[0].name == sidebarItemClass
-    }.also { it.trySetAccessible() }
-    private val styleMasker = runCatching { SidebarStyleMasker(sidebarControl) }.getOrNull()
 
-    private val navigatorCls = Class.forName("com.xuncorp.voxzen.ui.navigation.Navigator", false, loader)
-    private val screenRouteCls = Class.forName("com.xuncorp.voxzen.ui.navigation.ScreenRoute", false, loader)
-    private val navStackField = navigatorCls.getDeclaredField("navBackStack").apply { isAccessible = true }
-    private val navNavigate = navigatorCls.getMethod("navigate", screenRouteCls)
-    private val playerSheetField = navigatorCls.getDeclaredField("playerSheetState").apply { isAccessible = true }
-    private val playerExpanded = Class.forName("com.xuncorp.voxzen.ui.component.PlayerSheetState", false, loader).getMethod("Ԩ")
-    private val isDialogRoute = Class.forName("com.xuncorp.voxzen.ui.navigation.ScreenRouteKt", false, loader)
-        .getMethod("isDialogRoute", Class.forName("androidx.navigation3.runtime.NavKey", false, loader))
-
-    @Suppress("UNCHECKED_CAST")
-    val localNavigator: CompositionLocal<Any?> = Class.forName("com.xuncorp.voxzen.ui.navigation.AppNavigationKt", false, loader)
-        .getMethod("getLocalNavigator").invoke(null) as CompositionLocal<Any?>
-
-    fun currentRoute(nav: Any): Any? = (navStackField.get(nav) as? List<*>)?.lastOrNull()
+    fun currentRoute(nav: Any): Any? = (navigation.stack.get(nav) as? List<*>)?.lastOrNull()
 
     fun navigate(nav: Any, route: Any) {
-        navNavigate.invoke(nav, route)
+        navigation.navigateMethod.invoke(nav, route)
     }
 
-    fun hasHostOverlay(nav: Any): Boolean {
-        val route = currentRoute(nav)
-        val inDialog = route != null && isDialogRoute.invoke(null, route) == true
-        val inPlayer = playerExpanded.invoke(playerSheetField.get(nav)) == true
-        return inDialog || inPlayer
-    }
+    fun hasHostOverlay(nav: Any): Boolean = navigation.hasOverlay(nav, currentRoute(nav))
 
-    fun isMusicLibrary(item: Any?): Boolean {
-        if (item == null) return false
-        return runCatching {
-            routeGetter.invoke(item)?.javaClass?.name == "com.xuncorp.voxzen.ui.navigation.ScreenRoute\$MusicLibrary"
-        }.getOrDefault(false)
-    }
-
-    fun register(plugin: MainPlugin): List<AutoCloseable> {
+    fun register(plugin: MainPlugin, isActive: () -> Boolean): List<AutoCloseable> {
         val added = mutableListOf<AutoCloseable>()
         try {
             val registrar = WorkshopApi.hookRegistrar
-            val navClsName = navigatorCls.name
-            val routeParam = listOf(screenRouteCls.name)
-
-            // Close AutoMix overlay whenever the user switches to another destination.
-            for ((method, params) in listOf(
-                "navigate" to routeParam,
-                "replace" to routeParam,
-                "forward" to emptyList()
-            )) {
-                added += registrar.hookMethod(navClsName, method, params, object : MethodHook(90) {
-                    override fun before(call: MethodHookParam) {
-                        if (call.thisObject === AutoMixNav.boundNavigator) {
-                            AutoMixNav.onExternalNavigation(call.args.firstOrNull())
-                        }
-                    }
-                })
+            for (method in listOf(navigation.navigateMethod, navigation.replaceMethod, navigation.forwardMethod)) {
+                added += registrar.hookMethod(method.declaringClass.name, method.name,
+                    method.parameterTypes.map { it.name }, AutoMixNavigationHook(method == navigation.navigateMethod, isActive))
             }
 
-            // Intercept our self-triggered marker navigation so it never pushes onto the back stack.
-            added += registrar.hookMethod(navClsName, "navigate", routeParam, object : MethodHook(45) {
-                override fun before(call: MethodHookParam) {
-                    if (AutoMixNav.consumeIfPending(call.args.firstOrNull())) {
-                        call.setResult(null)
-                    }
-                }
-            })
-
-            // Handle back navigation while AutoMix is open above AppNavigation.
-            added += registrar.hookMethod(navClsName, "back", emptyList(), object : MethodHook(95) {
+            val back = navigation.backMethod
+            added += registrar.hookMethod(back.declaringClass.name, back.name, emptyList(), object : MethodHook(95) {
                 override fun before(call: MethodHookParam) {
                     val nav = call.thisObject ?: return
-                    if (AutoMixNav.consumeBack(nav)) {
+                    if (isActive() && runCatching { AutoMixNav.consumeBack(nav) }.getOrDefault(false)) {
                         call.setResult(null)
                     }
                 }
             })
 
-            // Render AutoMix standalone overlay inside Salt Layer via AppNavigation afterComposable (no Layer conflict).
-            added += registrar.afterComposable(
-                "com.xuncorp.voxzen.ui.navigation.AppNavigationKt",
-                "AppNavigation",
-                "androidx.compose.ui.Ɏ",
-                emptyList(),
-                40,
-                object : ComposableHook() {
+            val page = navigation.page
+            added += registrar.afterComposable(page.target.className, page.target.name, page.callerClass,
+                emptyList(), 40, object : ComposableHook() {
                     @Composable override fun Content(call: UiHookCall) {
-                        if (plugin.running) AutoMixOverlay(plugin, this@SidebarBridge)
+                        if (isActive()) AutoMixOverlay(plugin, this@SidebarBridge)
                     }
-                }
-            )
+                })
 
-            // Inject AutoMix row right after MusicLibrary in the left sidebar.
-            added += registrar.afterComposable(
-                "androidx.compose.ui.ଚ",
-                "Ϳ",
-                "androidx.compose.ui.ଚ\$Ԯ",
-                listOf(sidebarItemClass),
-                20,
-                object : ComposableHook() {
-                    @Composable override fun Content(call: UiHookCall) {
-                        if (plugin.running && isMusicLibrary(call.getArgument(0))) {
-                            AutoMixSidebarButton(this@SidebarBridge)
-                        }
-                    }
-                }
-            )
-
-            // Mask underlying host route's sidebar blue bar & highlight when AutoMix is open.
-            val masker = styleMasker
-            if (masker != null) {
+            // Isolate the native viewport inside AppNavigation, leaving the host's outer Salt Layer intact.
+            backdrop?.let { bridge ->
+                val site = bridge.site
                 runCatching {
-                    added += registrar.replaceComposable(
-                        "androidx.compose.ui.ଚ",
-                        "Ϳ",
-                        "androidx.compose.ui.ଚ\$Ԯ",
-                        listOf(sidebarItemClass),
-                        50,
+                    added += registrar.replaceComposable(site.target.className, site.target.name, site.callerClass,
+                        listOf("androidx.compose.ui.Modifier", "kotlin.jvm.functions.Function3"), 40,
                         object : ComposableHook() {
                             @Composable override fun Content(call: UiHookCall) {
+                                bridge.Render(call.getArgument(0) as Modifier, requireNotNull(call.getArgument(1)), isActive)
+                            }
+                        })
+                }
+            }
+
+            sidebar.getOrNull()?.let { targets ->
+                val site = targets.entry
+                val params = targets.routeAccessor.parameterTypes.dropLast(2).map { it.name }
+                val sidebarHook = runCatching {
+                    registrar.afterComposable(site.target.className, site.target.name, site.callerClass, params,
+                        20, object : ComposableHook() {
+                            @Composable override fun Content(call: UiHookCall) {
+                                val libraryRoute = runCatching {
+                                    targets.routeGetter.invoke(call.getArgument(0))?.javaClass?.name ==
+                                        "com.xuncorp.voxzen.ui.navigation.ScreenRoute\$MusicLibrary"
+                                }.getOrDefault(false)
+                                if (isActive() && libraryRoute) AutoMixSidebarButton(targets.control)
+                            }
+                        })
+                }
+                sidebarHook.onSuccess { added += it }
+                    .onFailure { sidebarWarning = it.message ?: it.javaClass.simpleName }
+
+                val masker = styleMasker
+                if (sidebarHook.isSuccess && masker != null) runCatching {
+                    added += registrar.replaceComposable(site.target.className, site.target.name, site.callerClass,
+                        params, 50, object : ComposableHook() {
+                            @Composable override fun Content(call: UiHookCall) {
                                 val item = call.getArgument(0)
-                                val current = masker.local.current
-                                val mask = plugin.running && AutoMixNav.visible
+                                val local = masker.local
+                                val current = local.current
+                                val mask = isActive() && AutoMixNav.visible
                                 val neutral = remember(current) {
-                                    if (current != null) runCatching { masker.unselected(current) }.getOrNull() else null
+                                    current?.let { runCatching { masker.unselected(it) }.getOrNull() }
                                 }
-                                val provided = if (mask && neutral != null) {
-                                    masker.local provides neutral
-                                } else {
-                                    masker.local provides current
-                                }
-                                CompositionLocalProvider(provided) {
-                                    routeAccessor.invoke(null, item, currentComposer, 0)
+                                CompositionLocalProvider(local provides if (mask) neutral ?: current else current) {
+                                    targets.routeAccessor.invoke(null, item, currentComposer, 0)
                                 }
                             }
-                        }
-                    )
+                        })
                 }
             }
             return added
-        } catch (t: Throwable) {
-            added.asReversed().forEach { runCatching { it.close() } }
-            throw t
+        } catch (failure: Throwable) {
+            added.asReversed().forEach { handle ->
+                runCatching { handle.close() }.exceptionOrNull()?.let(failure::addSuppressed)
+            }
+            throw failure
         }
     }
 }
@@ -392,7 +377,7 @@ private fun AutoMixSidebarIcon() {
 }
 
 @Composable
-private fun AutoMixSidebarButton(bridge: SidebarBridge) {
+private fun AutoMixSidebarButton(control: Method) {
     val active = AutoMixNav.visible
     val modifier = Modifier
         .semantics { contentDescription = "AutoMix"; selected = active }
@@ -402,7 +387,7 @@ private fun AutoMixSidebarButton(bridge: SidebarBridge) {
             AutoMixSidebarIcon()
         }
     }
-    bridge.sidebarControl.invoke(
+    control.invoke(
         null, "AutoMix", active, null, false, modifier, null, null,
         icon, currentComposer, 0, 108
     )
@@ -411,6 +396,7 @@ private fun AutoMixSidebarButton(bridge: SidebarBridge) {
 @Composable
 private fun AutoMixOverlay(plugin: MainPlugin, bridge: SidebarBridge) {
     val composer = currentComposer
+    bridge.backdrop?.Observe()
     val navigator = runCatching { composer.consume(bridge.localNavigator) }.getOrNull()
     DisposableEffect(navigator, bridge) {
         val handle = navigator?.let { nav ->
@@ -425,14 +411,12 @@ private fun AutoMixOverlay(plugin: MainPlugin, bridge: SidebarBridge) {
     }
     if (!AutoMixNav.visible) return
     Box(Modifier.fillMaxSize()) {
-        AutoMixPage(plugin)
+        AutoMixPage(plugin, bridge.skin(composer))
     }
 }
 
 @Composable
-private fun AutoMixPage(plugin: MainPlugin) {
-    val skin = HostSkin.read(currentComposer)
-
+private fun AutoMixPage(plugin: MainPlugin, skin: Skin) {
     DisposableEffect(plugin) {
         onDispose { plugin.worker.stopPreview() }
     }
@@ -440,9 +424,11 @@ private fun AutoMixPage(plugin: MainPlugin) {
     Box(
         Modifier
             .fillMaxSize()
-            .background(skin.background)
+            .background(skin.pageBackground)
+            // SPW places the player bar over the page instead of reducing its measured height.
+            .padding(bottom = 84.dp)
             .pointerInput(Unit) { detectTapGestures {} }
     ) {
-        NativeEditor(plugin, onBack = { AutoMixNav.close() })
+        NativeEditor(plugin, skin, onBack = { AutoMixNav.close() })
     }
 }
