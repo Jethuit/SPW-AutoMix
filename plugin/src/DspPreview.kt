@@ -23,7 +23,6 @@ internal object DspPreview {
     private const val FIR_HALF = 40
     private const val OVERSAMPLING = 4
     const val AUDITION_TARGET_LUFS = -14
-    private val bassReduction = 1.0 - 10.0.pow(Plan.HOST_BASS_CUT_DB / 20.0)
     private val sourcePeakCeiling = 10.0.pow(-2.5 / 20.0)
     private val truePeakCeiling = 10.0.pow(-1.0 / 20.0)
     private val releaseFactor = exp(-0.001 / 0.120)
@@ -32,6 +31,8 @@ internal object DspPreview {
     private val crossoverMidLow = butterworth(2500.0, lowPass = true)
     private val crossoverMidHigh = butterworth(2500.0, lowPass = false)
     private val echoLow = butterworth(4200.0, lowPass = true)
+    private val noiseHighPass = butterworth(450.0, lowPass = false)
+    private val noiseLowPass = butterworth(4800.0, lowPass = true)
     private val truePeakPhases = oversamplingPhases()
 
     fun canMatchLoudness(lufsA: Double, lufsB: Double): Boolean =
@@ -70,17 +71,17 @@ internal object DspPreview {
             outgoing = true, adjoiningContext = before > 0)
         val incoming = splitAndShape(samplesB, framesB, mixB, overlap, window, plan, trackGainB,
             outgoing = false, adjoiningContext = after > 0)
-        if (plan.filter == "low-out" || plan.filter == "both-low") {
-            sweepLowPass(outgoing, mixA, overlap, window, plan.pivot, outgoing = true, adjoiningContext = before > 0)
+        plan.filterSweep(0)?.let { sweep ->
+            sweepFilter(outgoing, mixA, overlap, window, plan.pivot, sweep, outgoing = true, adjoiningContext = before > 0)
         }
-        if (plan.filter == "low-in" || plan.filter == "both-low") {
-            sweepLowPass(incoming, mixB, overlap, window, plan.pivot, outgoing = false, adjoiningContext = after > 0)
+        plan.filterSweep(1)?.let { sweep ->
+            sweepFilter(incoming, mixB, overlap, window, plan.pivot, sweep, outgoing = false, adjoiningContext = after > 0)
         }
 
         val mixed = DoubleArray((before + overlap + after) * CHANNELS)
         outgoing.copyInto(mixed, startIndex = prefixA * CHANNELS, endIndex = mixA * CHANNELS)
         incoming.copyInto(mixed, (before + overlap) * CHANNELS, (mixB + overlap) * CHANNELS)
-        val echoSend = if (plan.echo) DoubleArray(overlap * CHANNELS) else null
+        val effectSend = if (plan.effect != TransitionEffect.None) DoubleArray(overlap * CHANNELS) else null
         val knots = window.gains(plan)
         var knot = 0
         for (frame in 0 until overlap) {
@@ -99,10 +100,14 @@ internal object DspPreview {
             for (channel in 0 until CHANNELS) {
                 val fadedA = outgoing[indexA + channel] * gainA
                 mixed[output + channel] = fadedA + incoming[indexB + channel] * gainB
-                if (echoSend != null) echoSend[send + channel] = fadedA
+                if (effectSend != null) effectSend[send + channel] = fadedA
             }
         }
-        if (echoSend != null) addEcho(mixed, echoSend, before, overlap, window, plan.bpmA)
+        if (effectSend != null) {
+            if (plan.echo) addEcho(mixed, effectSend, before, overlap, window, plan.bpmA)
+            else addReverb(mixed, effectSend, before, overlap, after, window, plan.effect)
+        }
+        if (plan.noiseTail) addNoiseTail(mixed, before, overlap, window)
         limitTruePeak(mixed)
         return wav(mixed)
     }
@@ -161,6 +166,13 @@ internal object DspPreview {
         fun sample(input: Double, channel: Int): Double = second.sample(first.sample(input, channel), channel)
     }
 
+    private class BandShape(val envelope: EqEnvelope, cutDb: Double, val softenEdge: Boolean) {
+        private val reduction = 1.0 - 10.0.pow(cutDb / 20.0)
+
+        fun gain(phase: Double, edgeBlend: Double): Double =
+            1.0 - reduction * envelope.attenuationAt(phase) * (if (softenEdge) edgeBlend else 1.0)
+    }
+
     private fun splitAndShape(
         input: FloatArray,
         frames: Int,
@@ -180,25 +192,32 @@ internal object DspPreview {
         val highMatchLow = CrossoverBranch(crossoverLow)
         val highMatchHigh = CrossoverBranch(crossoverHigh)
         val mixEnd = mixStart + overlap
-        val beatsWidth = if (plan.eq == "fast-bass-cut") 0.125 else 0.25
-        val width = (beatsWidth / (4 * plan.bars)).coerceAtLeast(1e-4)
-        fun reduction(phase: Double): Double {
-            val shape = smoothEdge((phase - plan.eqCenter) / width + 0.5)
-            return if (outgoing) shape else 1.0 - shape
-        }
+        val deck = if (outgoing) 0 else 1
         val edgePhase = if (outgoing) window.phaseStart else window.phaseEnd
-        val softenEdge = adjoiningContext && plan.eq != "none" && reduction(edgePhase) > 0.0
+        fun bandShape(band: EqBand): BandShape? = plan.eqEnvelope(deck, band)?.let { envelope ->
+            BandShape(envelope, band.cutDb, adjoiningContext && envelope.attenuationAt(edgePhase) > 0.0)
+        }
+        val lowEq = bandShape(EqBand.Low)
+        val midEq = bandShape(EqBand.Mid)
+        val highEq = bandShape(EqBand.High)
+        val hasEq = lowEq != null || midEq != null || highEq != null
+        val softenEdge = lowEq?.softenEdge == true || midEq?.softenEdge == true || highEq?.softenEdge == true
         val fade = minOf(overlap / 4, EFFECT_RAMP)
         val result = DoubleArray(frames * CHANNELS)
         for (frame in 0 until frames) {
             checkInterrupted(frame)
-            val lowGain = if (plan.eq != "none" && frame in mixStart until mixEnd) {
+            var lowGain = 1.0
+            var midGain = 1.0
+            var highGain = 1.0
+            if (hasEq && frame in mixStart until mixEnd) {
                 val position = frame - mixStart
                 val phase = window.phase(position.toDouble() / (overlap - 1))
                 val edge = if (outgoing) position else overlap - 1 - position
                 val blend = if (softenEdge && edge < fade) smoothEdge(edge.toDouble() / (fade - 1)) else 1.0
-                1.0 - bassReduction * reduction(phase) * blend
-            } else 1.0
+                lowGain = lowEq?.gain(phase, blend) ?: 1.0
+                midGain = midEq?.gain(phase, blend) ?: 1.0
+                highGain = highEq?.gain(phase, blend) ?: 1.0
+            }
             val index = frame * CHANNELS
             for (channel in 0 until CHANNELS) {
                 val sample = input.getOrElse(index + channel) { 0f }.toDouble()
@@ -207,18 +226,19 @@ internal object DspPreview {
                 val low = lowBranch.sample(lowMid, channel)
                 val mid = midBranch.sample(lowMid, channel)
                 val highMatched = highMatchLow.sample(high, channel) + highMatchHigh.sample(high, channel)
-                result[index + channel] = gain * (low * lowGain + mid + highMatched)
+                result[index + channel] = gain * (low * lowGain + mid * midGain + highMatched * highGain)
             }
         }
         return result
     }
 
-    private fun sweepLowPass(
+    private fun sweepFilter(
         audio: DoubleArray,
         mixStart: Int,
         frames: Int,
         window: TransitionWindow,
         pivot: Double,
+        sweep: FilterSweep,
         outgoing: Boolean,
         adjoiningContext: Boolean
     ) {
@@ -235,12 +255,10 @@ internal object DspPreview {
         if (start >= end) return
         val clippedAtEdge = if (outgoing) window.phaseStart > pivot else window.phaseEnd < pivot
         val ramp = fade > 1 && end - start >= fade && (!clippedAtEdge || adjoiningContext)
-        val ratio = Plan.HOST_LPF_MAX_HZ / Plan.HOST_LPF_MIN_HZ
         fun coefficientsAt(frame: Int): Coefficients {
             val phase = window.phase(frame.toDouble() / (frames - 1))
-            val open = if (outgoing) (1.0 - phase) / (1.0 - pivot) else phase / pivot
-            val cutoff = Plan.HOST_LPF_MIN_HZ * ratio.pow(open.coerceIn(0.0, 1.0))
-            return butterworth(cutoff, lowPass = true)
+            val cutoff = sweep.cutoff(phase, pivot, outgoing).coerceIn(15.0, RATE * 0.45)
+            return butterworth(cutoff, lowPass = sweep.lowPass)
         }
         val first = mixStart + start
         val filter = Biquad(coefficientsAt(start))
@@ -270,9 +288,92 @@ internal object DspPreview {
         }
     }
 
+    private fun addNoiseTail(output: DoubleArray, before: Int, overlap: Int, window: TransitionWindow) {
+        val fade = minOf(overlap / 4, EFFECT_RAMP)
+        val softenStart = Plan.noiseGain(window.phaseStart) > 0.0
+        val softenEnd = Plan.noiseGain(window.phaseEnd) > 0.0
+        // Keep the preview repeatable and roll off the hiss at both ends of the spectrum.
+        val random = SplittableRandom(0x4E4F495345L)
+        val highPass = Biquad(noiseHighPass)
+        val lowPass = Biquad(noiseLowPass)
+        for (frame in 0 until overlap) {
+            checkInterrupted(frame)
+            val phase = window.phase(frame.toDouble() / (overlap - 1))
+            var gain = Plan.noiseGain(phase)
+            if (gain <= 0.0) continue
+            if (softenStart && frame < fade) gain *= smoothEdge(frame.toDouble() / (fade - 1))
+            val remaining = overlap - 1 - frame
+            if (softenEnd && remaining < fade) gain *= smoothEdge(remaining.toDouble() / (fade - 1))
+            val index = (before + frame) * CHANNELS
+            for (channel in 0 until CHANNELS) {
+                val white = random.nextDouble(-1.0, 1.0)
+                val colored = lowPass.sample(highPass.sample(white, channel), channel)
+                output[index + channel] += gain * colored
+            }
+        }
+    }
+
     private fun smoothEdge(progress: Double): Double {
         val t = progress.coerceIn(0.0, 1.0)
         return t * t * (3.0 - 2.0 * t)
+    }
+
+    private class ReverbDelay(frames: Int) {
+        private val buffer = DoubleArray(frames)
+        private var position = 0
+        private var damped = 0.0
+
+        private fun push(sample: Double) {
+            buffer[position] = sample
+            position++
+            if (position == buffer.size) position = 0
+        }
+
+        fun comb(input: Double): Double {
+            val delayed = buffer[position]
+            damped += 0.65 * (delayed - damped)
+            push(input + 0.74 * damped)
+            return delayed
+        }
+
+        fun diffuse(input: Double): Double {
+            val delayed = buffer[position]
+            val output = delayed - 0.55 * input
+            push(input + 0.55 * output)
+            return output
+        }
+    }
+
+    private fun addReverb(
+        output: DoubleArray,
+        send: DoubleArray,
+        before: Int,
+        overlap: Int,
+        after: Int,
+        window: TransitionWindow,
+        effect: TransitionEffect
+    ) {
+        val tailFrames = if (effect == TransitionEffect.ReverbEndCut) 0 else 750 * FRAMES_PER_MS
+        val renderFrames = overlap + minOf(tailFrames, after)
+        val endWet = window.reverbWet(effect, 1.0)
+        for (channel in 0 until CHANNELS) {
+            val stereoOffset = channel * 37
+            val short = ReverbDelay(1427 + stereoOffset)
+            val medium = ReverbDelay(1601 + stereoOffset)
+            val long = ReverbDelay(1777 + stereoOffset)
+            val longest = ReverbDelay(1973 + stereoOffset)
+            val firstDiffuser = ReverbDelay(239 + stereoOffset)
+            val secondDiffuser = ReverbDelay(83 + stereoOffset)
+            for (frame in 0 until renderFrames) {
+                checkInterrupted(frame)
+                val input = if (frame < overlap) send[frame * CHANNELS + channel] else 0.0
+                val sum = short.comb(input) + medium.comb(input) + long.comb(input) + longest.comb(input)
+                val reflections = secondDiffuser.diffuse(firstDiffuser.diffuse(sum * 0.25))
+                val wet = if (frame < overlap) window.reverbWet(effect, frame.toDouble() / (overlap - 1))
+                    else endWet * (1.0 - smoothEdge((frame - overlap + 1.0) / tailFrames))
+                output[(before + frame) * CHANNELS + channel] += 0.45 * wet * reflections
+            }
+        }
     }
 
     private fun addEcho(

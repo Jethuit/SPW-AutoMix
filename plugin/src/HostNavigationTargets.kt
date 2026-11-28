@@ -67,6 +67,17 @@ internal class HostNavigationTargets(symbols: HostSymbols) {
         it.addsRoute() && it.symbol.arguments.isEmpty()
     }.uniqueHost("宿主前进").symbol)
 
+    private val navClass = symbols.resolve(navType)
+    private val forwardEntries = runCatching {
+        navClass.declaredFields.singleOrNull {
+            it.type == java.util.List::class.java && !java.lang.reflect.Modifier.isStatic(it.modifiers)
+        }?.takeIf { it.trySetAccessible() }
+    }.getOrNull()
+
+    fun forwardHistory(navigator: Any): List<Any?>? = runCatching {
+        (forwardEntries?.get(navigator) as? List<*>)?.toList()
+    }.getOrNull()
+
     private val dialog = symbols.method(back.calls.filter {
         it.descriptor == "(Landroidx/navigation3/runtime/NavKey;)Z" && symbols.body(it)?.isStatic == true
     }.distinct().uniqueHost("宿主弹窗判定"))

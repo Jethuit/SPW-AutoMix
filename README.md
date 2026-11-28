@@ -2,7 +2,7 @@
 
 > 给 Salt Player for Windows（SPW）加上 DJ 式的歌曲转场：自动找切点、对拍、交换低音，也能在双轨波形上手动微调并试听。
 
-**[⬇ 下载 v0.1.0（.spmod）](https://github.com/Jethuit/SPW-AutoMix/releases/download/v0.1.0/SPW-AutoMix-v0.1.0.spmod)** · [全部版本](https://github.com/Jethuit/SPW-AutoMix/releases) · [发布说明](docs/releases/v0.1.0.md)
+**[下载安装包（.spmod）](https://github.com/Jethuit/SPW-AutoMix/releases)** · [v0.3.0 更新说明](docs/releases/v0.3.0.md)
 
 | 项目 | 说明 |
 | --- | --- |
@@ -42,7 +42,8 @@
 
 - **拖动波形**：上方 A 轨调整退出点，下方 B 轨调整进入点。开启「拍点磁吸」后会自动对齐小节首拍或拍点。
 - **调参数**：过渡长度（2 / 4 / 8 小节）、音量曲线、均衡器（低音交接）、滤波、效果。鼠标悬停在选项上时，波形会先预览曲线，点击后才生效。
-- 满意后点右上角 **保存**。保存只作用于这一对歌曲的这个方向（A → B）。
+- 满意后点波形图下方、图例右侧的 **保存**。保存只作用于这一对歌曲的这个方向（A → B）。
+- 右上角的 **关于** 可查看版本、上次成功检查时间和发布页。自动检查默认开启，每天检查一次。发现新版时会提示，关闭开关后仍可手动检查。
 
 ### 3. 让正常播放也用上 AutoMix
 
@@ -54,8 +55,6 @@
 1. 你手动保存过的曲对方案；
 2. AutoMix 在后台为下一首准备好的自动推荐；
 3. 推荐未就绪或已错过切点时，回退为原速匹配。
-
-> 某一对歌曲想交给 SPW 自己处理时，选择「沿用 SPW」即可。
 
 ## 歌单编排
 
@@ -85,7 +84,7 @@
 
 ## 从源码构建
 
-需要 Python 3。在仓库根目录运行：
+需要 Python 3.12 或更新版本。首次构建离线包时，还需要 MSYS2 的 GNU Make、NASM 和 LLVM-MinGW 20261117（UCRT、x86_64）。用 `AUTOMIX_FFMPEG_BASH` 指定 MSYS2 的 `usr/bin/bash.exe`，用 `AUTOMIX_FFMPEG_LLVM_BIN` 指定 LLVM-MinGW 的 `bin` 目录。构建脚本会校验 FFmpeg 源码并缓存编译好的解码器。
 
 ```powershell
 # 正式版：内置 FFmpeg，可离线使用
@@ -95,7 +94,7 @@ py -3 tools/build_plugin.py
 py -3 tools/build_plugin.py --system-runtime
 ```
 
-安装包输出到 `build/libs/`，轻量版文件名带 `.lite` 后缀。轻量版会从 SPW 进程的 `PATH` 中查找 FFmpeg，也可以用环境变量 `AUTOMIX_FFMPEG` 指定路径（修改后需重启 SPW）。版本号约定见 [AGENT.md](AGENT.md)。
+安装包默认输出到 `build/libs/`，可用 `--output-dir` 指定其他目录。发布离线包时一并提供同目录的 `-FFmpeg-source.zip`，其中包括对应源码和构建配方。轻量版文件名带 `.lite` 后缀，会从 SPW 进程的 `PATH` 中查找 FFmpeg，也可以用环境变量 `AUTOMIX_FFMPEG` 指定路径（修改后需重启 SPW）。版本号约定见 [AGENT.md](AGENT.md)。
 
 ## 项目结构
 
@@ -120,4 +119,4 @@ docs/              需求、技术设计、验证计划与发布说明
 
 - AutoMix 自有代码采用 [MIT 许可证](LICENSE)。
 - 第三方代码保留各自的许可声明。 [SPW Listen Stats](plugin/resources/META-INF/LICENSE-SPW-Listen-Stats) · [SPW-Lyrics](plugin/resources/META-INF/LICENSE-SPW-Lyrics) · [Compose 索引工具](tools/LICENSE-RestoreComposeIndex)
-- 离线包内的 FFmpeg 在独立进程中运行，随包附有 GPLv3 许可和构建说明。 [FFmpeg 构建](https://github.com/GyanD/codexffmpeg/releases/tag/9.0.2) · [FFmpeg 源码](https://github.com/FFmpeg/FFmpeg/tree/946fcce07b)
+- 离线包内的 FFmpeg 在独立进程中运行，采用 LGPL v2.1 或更高版本许可。 [FFmpeg 构建](tools/build_ffmpeg.sh) · [FFmpeg 源码](https://github.com/FFmpeg/FFmpeg/tree/946fcce07b)

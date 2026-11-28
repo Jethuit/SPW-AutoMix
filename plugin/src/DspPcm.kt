@@ -11,6 +11,8 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 
+internal class AudioRuntimeException(message: String, cause: IOException) : IOException(message, cause)
+
 internal object DspPcm {
     const val TRACK_LIMIT_SECONDS = 15 * 60
     private const val MAX_PCM_BYTES = TRACK_LIMIT_SECONDS * 22050 * Float.SIZE_BYTES
@@ -44,7 +46,8 @@ internal object DspPcm {
         val process = try {
             ProcessBuilder(command).start()
         } catch (e: IOException) {
-            throw IOException("无法启动 FFmpeg · ${e.message}", e)
+            checkDspInterrupted()
+            throw AudioRuntimeException("无法启动 FFmpeg · ${e.message}", e)
         }
         val pcm = FutureTask {
             val stream = process.inputStream
@@ -71,13 +74,14 @@ internal object DspPcm {
             }
         }
         try {
+            checkDspInterrupted()
             Thread.startVirtualThread(pcm)
             Thread.startVirtualThread(stderr)
             val decoded = pcm.get()
             val stoppedAfterClip = decoded.completeClip && !process.waitFor(200, TimeUnit.MILLISECONDS)
             if (stoppedAfterClip) {
                 // The requested PCM is complete. An encoder that keeps writing must not delay the audition.
-                process.destroyForcibly()
+                stopProcess(process)
             }
             val exitCode = process.waitFor()
             val diagnostic = stderr.get()
@@ -88,14 +92,22 @@ internal object DspPcm {
             return decoded.samples
         } catch (e: ExecutionException) {
             val cause = e.cause ?: e
+            if (cause is InterruptedException) throw cause
             if (cause is Error) throw cause
             throw IOException(cause.message ?: "读取 PCM 数据失败", cause)
         } finally {
-            if (process.isAlive) process.destroyForcibly()
-            if (pcm.isDone) runCatching { process.inputStream.close() }
+            val pcmDone = pcm.isDone
             pcm.cancel(true)
             stderr.cancel(true)
+            if (process.isAlive) stopProcess(process)
+            if (pcmDone) runCatching { process.inputStream.close() }
         }
+    }
+
+    private fun stopProcess(process: Process) {
+        // A system-runtime launcher can inherit the decoder's stdout/stderr in a child process.
+        runCatching { process.descendants().use { children -> children.forEach { it.destroyForcibly() } } }
+        process.destroyForcibly()
     }
 
     private fun InputStream.readTrack(limit: Int, frameBytes: Int, rate: Int): FloatArray {

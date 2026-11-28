@@ -1,4 +1,9 @@
-@file:OptIn(androidx.compose.runtime.InternalComposeApi::class, com.xuncorp.spw.workshop.api.UnstableSpwWorkshopApi::class)
+@file:OptIn(
+    androidx.compose.runtime.InternalComposeApi::class,
+    androidx.compose.ui.ExperimentalComposeUiApi::class,
+    com.moriafly.salt.ui.UnstableSaltUiApi::class,
+    com.xuncorp.spw.workshop.api.UnstableSpwWorkshopApi::class
+)
 package automix
 
 import androidx.compose.animation.core.Animatable
@@ -14,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
@@ -36,11 +42,18 @@ import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerInputChange
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.isPrimaryPressed
+import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -49,9 +62,28 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.moriafly.salt.ui.BasicButton
+import com.moriafly.salt.ui.ButtonColors
+import com.moriafly.salt.ui.Card as SaltUiCard
+import com.moriafly.salt.ui.ControlSize
+import com.moriafly.salt.ui.ItemDivider
+import com.moriafly.salt.ui.SaltColors
+import com.moriafly.salt.ui.SaltConfigs
+import com.moriafly.salt.ui.SaltDynamicColors
+import com.moriafly.salt.ui.SaltShapes
+import com.moriafly.salt.ui.SaltTextStyles
+import com.moriafly.salt.ui.SaltTheme
+import com.moriafly.salt.ui.Switcher
+import com.moriafly.salt.ui.Text as SaltText
+import com.moriafly.salt.ui.material.glass
+import com.moriafly.salt.ui.material.glassSource
+import com.moriafly.salt.ui.material.rememberGlassSource
+import com.moriafly.salt.ui.popup.PopupMenuBackdrop
+import com.moriafly.salt.ui.screen.BasicScreenDefaults
 import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint.MediaItem
 import com.xuncorp.spw.workshop.api.WorkshopApi
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.*
 
@@ -69,12 +101,35 @@ internal data class Skin(
     val sub: TextStyle,
     val cardShape: Shape,
     val pageBackground: Color = background,
-    val popup: Color = surface
+    val popup: Color = surface,
+    val success: Color = if (isDark) Color(0xFF34D399) else Color(0xFF10B981),
+    val warning: Color = if (isDark) Color(0xFFFBBF24) else Color(0xFFF59E0B),
+    val error: Color = if (isDark) Color(0xFFF87171) else Color(0xFFEF4444),
+    val paragraph: TextStyle = sub,
+    val largeTitle: TextStyle = main,
+    val smallShape: Shape = RoundedCornerShape(8.dp),
+    val largeShape: Shape = RoundedCornerShape(14.dp),
+    val hover: Color = if (isDark) Color(0xFF383A40) else Color(0xFFE6E8EC),
+    val selectedControl: Color = if (isDark) Color(0xFF3E414A) else Color.White
 ) {
     fun popupBackground(): Color {
         val base = if (isDark) Color(0xFF191D23) else Color.White
         return popup.compositeOver(background.compositeOver(base))
     }
+
+    fun toSaltColors(): SaltColors = SaltColors(
+        highlight = accent,
+        text = text,
+        subText = muted,
+        background = background,
+        subBackground = surface,
+        popup = popupBackground(),
+        stroke = line,
+        onHighlight = onAccent,
+        success = success,
+        warning = warning,
+        error = error
+    )
 }
 
 private data class StagePalette(
@@ -127,14 +182,18 @@ internal class HostSkin(symbols: HostSymbols) {
     }.symbol)
     private val palette = colorType.constructorProperties("highlight", "text", "subText", "background", "subBackground",
         "popup", "stroke", "onHighlight", "success", "warning", "error").let { fields ->
-        listOf("highlight", "text", "subText", "background", "subBackground", "stroke", "onHighlight", "popup")
+        listOf("highlight", "text", "subText", "background", "subBackground", "stroke", "onHighlight", "popup",
+            "success", "warning", "error")
             .map { getter(symbols, colorType, fields.getValue(it), "J") }
     }
     private val fonts = styleType.constructorProperties("main", "sub", "paragraph", "largeTitle").let { fields ->
-        listOf("main", "sub").map { getter(symbols, styleType, fields.getValue(it), "Landroidx/compose/ui/text/TextStyle;") }
+        listOf("main", "sub", "paragraph", "largeTitle")
+            .map { getter(symbols, styleType, fields.getValue(it), "Landroidx/compose/ui/text/TextStyle;") }
     }
-    private val mediumShape = getter(symbols, shapeType,
-        shapeType.constructorProperties("small", "medium", "large").getValue("medium"), "Landroidx/compose/ui/graphics/Shape;")
+    private val shapeGetters = shapeType.constructorProperties("small", "medium", "large").let { fields ->
+        listOf("small", "medium", "large")
+            .map { getter(symbols, shapeType, fields.getValue(it), "Landroidx/compose/ui/graphics/Shape;") }
+    }
 
     fun read(composer: Composer): Skin {
         val cfg = configs.invoke(null, composer)
@@ -145,37 +204,61 @@ internal class HostSkin(symbols: HostSymbols) {
         val isDark = runCatching { isDarkFlag.invoke(cfg) as Boolean }.getOrElse {
             (p[4].red * 0.299f + p[4].green * 0.587f + p[4].blue * 0.114f) < 0.45f
         }
-        val cardShape = runCatching { mediumShape.invoke(sh) as Shape }.getOrElse { RoundedCornerShape(12.dp) }
+        val mainStyle = fonts[0].invoke(s) as TextStyle
+        val subStyle = fonts[1].invoke(s) as TextStyle
+        val paragraphStyle = runCatching { fonts[2].invoke(s) as TextStyle }.getOrDefault(subStyle)
+        val largeTitleStyle = runCatching { fonts[3].invoke(s) as TextStyle }.getOrDefault(mainStyle)
+        val smallShape = runCatching { shapeGetters[0].invoke(sh) as Shape }.getOrElse { RoundedCornerShape(8.dp) }
+        val cardShape = runCatching { shapeGetters[1].invoke(sh) as Shape }.getOrElse { RoundedCornerShape(14.dp) }
+        val largeShape = runCatching { shapeGetters[2].invoke(sh) as Shape }.getOrElse { RoundedCornerShape(14.dp) }
+        // Match SPW's official light/dark card & control surface hierarchy while inheriting host accent/text/fonts.
+        val pageBg = if (isDark) Color(0xFF232323) else Color(0xFFF8F8F8)
+        val cardBg = if (isDark) Color(0xFF2A2A2A) else Color(0xFFFCFCFC)
+        val controlBg = if (isDark) Color(0xFF32343A) else Color(0xFFEDEEF1)
+        val strokeCol = if (isDark) Color(0xFF393B41) else Color(0xFFE7E8EC)
+        val hoverCol = if (isDark) Color(0xFF383A40) else Color(0xFFE6E8EC)
+        val selectedCtrl = if (isDark) Color(0xFF3E414A) else Color.White
         return Skin(
             isDark = isDark,
             accent = p[0],
             text = p[1],
             muted = p[2],
-            background = p[3],
-            surface = p[4],
-            line = p[5],
+            background = controlBg,
+            surface = cardBg,
+            line = strokeCol,
             onAccent = p[6],
-            main = fonts[0].invoke(s) as TextStyle,
-            sub = fonts[1].invoke(s) as TextStyle,
+            main = mainStyle,
+            sub = subStyle,
             cardShape = cardShape,
-            pageBackground = p[3].compositeOver(if (isDark) Color(0xFF181B20) else Color(0xFFF5F6F8)),
-            popup = p[7]
+            pageBackground = pageBg,
+            popup = p[7],
+            success = p[8],
+            warning = p[9],
+            error = p[10],
+            paragraph = paragraphStyle,
+            largeTitle = largeTitleStyle,
+            smallShape = smallShape,
+            largeShape = largeShape,
+            hover = hoverCol,
+            selectedControl = selectedCtrl
         )
     }
 }
 
 internal fun fallbackSkin(dark: Boolean) = Skin(
     isDark = dark,
-    accent = if (dark) Color(0xFF60A5FA) else Color(0xFF2563EB),
-    text = if (dark) Color(0xFFF1F5F9) else Color(0xFF17202D),
-    muted = if (dark) Color(0xFFADB7C6) else Color(0xFF526071),
-    background = if (dark) Color(0xFF181B20) else Color(0xFFF5F6F8),
-    surface = if (dark) Color(0xFF22262D) else Color.White,
-    line = if (dark) Color(0xFF38404A) else Color(0xFFDADFE6),
+    accent = if (dark) Color(0xFF79B5FF) else Color(0xFF2777D8),
+    text = if (dark) Color(0xFFEDEDEE) else Color(0xFF25272B),
+    muted = if (dark) Color(0xFFA0A3AB) else Color(0xFF777B82),
+    background = if (dark) Color(0xFF32343A) else Color(0xFFEDEEF1),
+    surface = if (dark) Color(0xFF2A2A2A) else Color(0xFFFCFCFC),
+    line = if (dark) Color(0xFF393B41) else Color(0xFFE7E8EC),
     onAccent = if (dark) Color(0xFF101923) else Color.White,
     main = TextStyle(fontSize = 14.sp),
     sub = TextStyle(fontSize = 12.sp),
-    cardShape = RoundedCornerShape(12.dp)
+    cardShape = RoundedCornerShape(14.dp),
+    pageBackground = if (dark) Color(0xFF232323) else Color(0xFFF8F8F8),
+    popup = if (dark) Color(0xFF2A2A2A) else Color(0xFFFCFCFC)
 )
 
 private fun stagePalette(skin: Skin): StagePalette {
@@ -227,7 +310,7 @@ private fun stagePalette(skin: Skin): StagePalette {
     }
 }
 
-private data class TrackWaves(
+internal data class TrackWaves(
     val peaks: IntArray,
     val low: IntArray,
     val mid: IntArray,
@@ -239,35 +322,60 @@ private data class TrackWaves(
     val keyLabel: String?
 )
 
-private val transitionEffects = linkedMapOf(false to "无效果", true to "半拍回声")
+internal data class PairAnalysisSnapshot(
+    val waveA: TrackWaves,
+    val waveB: TrackWaves,
+    val autoPlan: Plan,
+    val reasons: List<String>
+)
+
+internal class AutoMixUiCache {
+    var library: List<MediaItem> = emptyList()
+    var queue: QueueView = QueueView()
+    var playlists: List<SpwPlaylist> = emptyList()
+    var selectedPlaylistId: String? = null
+    var selectedA: MediaItem? = null
+    var selectedB: MediaItem? = null
+    var selectedPairKeys: Pair<String, String>? = null
+    var playlistTab: String = "queue"
+    var initialized: Boolean = false
+    var queueScrolledToCurrent: Boolean = false
+    val covers = PlaylistCoverStore()
+    val trackMetadata = mutableStateMapOf<String, TrackAnalysisMetadata>()
+    val pairCache = object : LinkedHashMap<String, PairAnalysisSnapshot>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PairAnalysisSnapshot>) = size > 12
+    }
+    val editHistories = mutableMapOf<String, TransitionEditHistory>()
+}
+
 private val transitionLengths = linkedMapOf(2 to "2 小节", 4 to "4 小节", 8 to "8 小节")
 
 @Composable
 private fun SaltCard(content: @Composable ColumnScope.() -> Unit) {
-    val s = LocalSkin.current
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(s.cardShape)
-            .background(s.surface)
-            .border(0.5.dp, s.line, s.cardShape)
-            .padding(horizontal = 14.dp, vertical = 10.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        content = content
-    )
+    SaltUiCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = SaltTheme.colors.subBackground,
+        border = BorderStroke(1.dp, SolidColor(SaltTheme.colors.stroke))
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            content = content
+        )
+    }
 }
 
 @Composable
 private fun SaltDivider() {
-    val s = LocalSkin.current
-    Box(Modifier.fillMaxWidth().height(0.5.dp).background(s.line))
+    ItemDivider(color = SaltTheme.colors.stroke)
 }
 
 @Composable
 private fun Label(text: String, small: Boolean = false, color: Color? = null) {
-    val s = LocalSkin.current
-    val base = if (small) s.sub else s.main
-    BasicText(text, style = base.copy(color = color ?: if (small) s.muted else s.text))
+    val base = if (small) SaltTheme.textStyles.sub else SaltTheme.textStyles.main
+    val resolvedColor = color ?: if (small) SaltTheme.colors.subText else SaltTheme.colors.text
+    BasicText(text, style = base.copy(color = resolvedColor))
 }
 
 @Composable
@@ -277,43 +385,113 @@ private fun Chip(
     enabled: Boolean = true,
     primary: Boolean = false,
     compact: Boolean = false,
-    description: String? = null,
+    quiet: Boolean = false,
     click: () -> Unit
 ) {
-    val s = LocalSkin.current
-    val shape = RoundedCornerShape(7.dp)
+    val skin = LocalSkin.current
+    val colors = SaltTheme.colors
+    val isDark = SaltTheme.configs.isDarkTheme
+    var hovered by remember { mutableStateOf(false) }
     val bg = when {
-        primary -> s.accent
-        selected -> s.accent.copy(alpha = if (s.isDark) 0.24f else 0.12f)
-        else -> s.background
+        primary -> colors.highlight
+        selected -> colors.highlight.copy(alpha = if (isDark) 0.24f else 0.12f)
+        hovered && enabled -> skin.hover
+        quiet -> Color.Transparent
+        else -> colors.background
     }
-    val borderCol = when {
-        primary -> s.accent
-        selected -> s.accent.copy(alpha = 0.55f)
-        else -> s.line
+    val border = when {
+        !enabled || quiet -> null
+        primary -> BorderStroke(1.dp, SolidColor(colors.highlight))
+        selected -> BorderStroke(1.dp, SolidColor(colors.highlight.copy(alpha = 0.45f)))
+        else -> null
     }
     val textCol = when {
-        !enabled -> s.muted
-        primary -> s.onAccent
-        selected -> s.accent
-        else -> s.text
+        primary -> colors.onHighlight
+        selected -> colors.highlight
+        else -> colors.text
     }
-    Box(
-        Modifier
-            .clip(shape)
-            .background(bg)
-            .border(0.5.dp, borderCol, shape)
-            .clickable(enabled = enabled, onClick = click)
-            .then(if (description == null) Modifier else Modifier.semantics { contentDescription = description })
-            .padding(horizontal = if (compact) 8.dp else 12.dp, vertical = if (compact) 4.dp else 6.dp)
+    BasicButton(
+        onClick = click,
+        modifier = Modifier
+            .onPointerEvent(PointerEventType.Enter) { hovered = true }
+            .onPointerEvent(PointerEventType.Exit) { hovered = false },
+        enabled = enabled,
+        size = if (compact) ControlSize.Small else ControlSize.Regular,
+        shape = SaltTheme.shapes.small,
+        colors = ButtonColors(
+            containerColor = bg,
+            contentColor = textCol,
+            disabledContainerColor = if (quiet) Color.Transparent else colors.background,
+            disabledContentColor = colors.subText
+        ),
+        border = border,
+        contentPadding = PaddingValues(horizontal = if (compact) 10.dp else 13.dp, vertical = if (compact) 5.dp else 7.dp)
     ) {
         BasicText(
             text,
-            style = s.sub.copy(
-                color = textCol,
+            style = SaltTheme.textStyles.sub.copy(
+                color = if (enabled) textCol else colors.subText,
                 fontWeight = if (primary || selected) FontWeight.Medium else FontWeight.Normal
-            )
+            ),
+            maxLines = 1
         )
+    }
+}
+
+@Composable
+private fun SegmentedTabs(
+    options: List<Pair<String, String>>,
+    selected: String,
+    modifier: Modifier = Modifier,
+    onSelect: (String) -> Unit
+) {
+    val skin = LocalSkin.current
+    val colors = SaltTheme.colors
+    val outerShape = RoundedCornerShape(8.dp)
+    val itemShape = RoundedCornerShape(5.dp)
+    Row(
+        modifier
+            .fillMaxWidth()
+            .height(34.dp)
+            .clip(outerShape)
+            .background(colors.background)
+            .padding(3.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        for ((key, label) in options) {
+            val active = key == selected
+            var hovered by remember(key) { mutableStateOf(false) }
+            Box(
+                Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(itemShape)
+                    .onPointerEvent(PointerEventType.Enter) { hovered = true }
+                    .onPointerEvent(PointerEventType.Exit) { hovered = false }
+                    .background(when {
+                        active -> skin.selectedControl
+                        hovered -> skin.hover
+                        else -> Color.Transparent
+                    })
+                    .then(if (active) Modifier.border(1.dp, colors.stroke, itemShape) else Modifier)
+                    .semantics {
+                        this.selected = active
+                    }
+                    .clickable(role = Role.Tab) { onSelect(key) },
+                contentAlignment = Alignment.Center
+            ) {
+                BasicText(
+                    label,
+                    style = SaltTheme.textStyles.sub.copy(
+                        color = if (active) colors.text else colors.subText,
+                        fontWeight = if (active) FontWeight.Medium else FontWeight.Normal
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
     }
 }
 
@@ -324,27 +502,42 @@ private fun EqualPresetTile(
     modifier: Modifier = Modifier,
     click: () -> Unit
 ) {
-    val s = LocalSkin.current
-    val shape = RoundedCornerShape(8.dp)
-    val bg = if (selected) s.accent else s.background
-    val borderCol = if (selected) s.accent else s.line
-    val textCol = if (selected) s.onAccent else s.text
-    Box(
-        modifier
-            .height(32.dp)
-            .clip(shape)
-            .background(bg)
-            .border(0.5.dp, borderCol, shape)
-            .clickable(onClick = click),
-        contentAlignment = Alignment.Center
+    val skin = LocalSkin.current
+    val colors = SaltTheme.colors
+    val isDark = SaltTheme.configs.isDarkTheme
+    var hovered by remember { mutableStateOf(false) }
+    val bg = when {
+        selected -> colors.highlight.copy(alpha = if (isDark) 0.24f else 0.13f)
+        hovered -> skin.hover
+        else -> colors.background
+    }
+    val border = if (selected) BorderStroke(1.dp, SolidColor(colors.highlight.copy(alpha = 0.50f))) else null
+    val textCol = if (selected) colors.highlight else colors.text
+    BasicButton(
+        onClick = click,
+        modifier = modifier
+            .height(34.dp)
+            .onPointerEvent(PointerEventType.Enter) { hovered = true }
+            .onPointerEvent(PointerEventType.Exit) { hovered = false },
+        size = ControlSize.Regular,
+        shape = SaltTheme.shapes.small,
+        colors = ButtonColors(
+            containerColor = bg,
+            contentColor = textCol,
+            disabledContainerColor = colors.background,
+            disabledContentColor = colors.subText
+        ),
+        border = border,
+        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp)
     ) {
         BasicText(
             text,
-            style = s.sub.copy(
+            style = SaltTheme.textStyles.sub.copy(
                 color = textCol,
-                fontSize = 11.sp,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal
-            )
+                fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal
+            ),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }
@@ -358,43 +551,39 @@ private fun SwitchTile(
     modifier: Modifier = Modifier,
     onToggle: () -> Unit
 ) {
-    val s = LocalSkin.current
-    val shape = RoundedCornerShape(8.dp)
+    val skin = LocalSkin.current
+    val colors = SaltTheme.colors
+    val shape = SaltTheme.shapes.small
+    var hovered by remember { mutableStateOf(false) }
     Row(
         modifier
+            .height(36.dp)
             .clip(shape)
-            .background(s.background)
-            .border(0.5.dp, s.line, shape)
-            .clickable(enabled = enabled, onClick = onToggle)
-            .padding(horizontal = 8.dp, vertical = 7.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
+            .onPointerEvent(PointerEventType.Enter) { hovered = true }
+            .onPointerEvent(PointerEventType.Exit) { hovered = false }
+            .background(if (hovered && enabled) skin.hover else colors.background)
+            .clickable(enabled = enabled, role = Role.Switch, onClick = onToggle)
+            .padding(horizontal = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.width(3.dp).height(13.dp).clip(RoundedCornerShape(2.dp)).background(barColor))
-            BasicText(title, style = s.sub.copy(color = if (enabled) s.text else s.muted, fontSize = 11.sp, fontWeight = FontWeight.Medium))
-        }
-        val trackCol = when {
-            !enabled -> s.line.copy(alpha = 0.5f)
-            checked -> s.accent
-            else -> s.line
-        }
-        Box(
-            Modifier
-                .width(36.dp)
-                .height(20.dp)
-                .clip(RoundedCornerShape(999.dp))
-                .background(trackCol)
-                .padding(2.dp),
-            contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart
+        Row(
+            Modifier.weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                Modifier
-                    .size(16.dp)
-                    .clip(RoundedCornerShape(999.dp))
-                    .background(if (enabled) Color.White else s.surface)
+            Box(Modifier.size(6.dp).clip(CircleShape).background(barColor))
+            BasicText(
+                title,
+                style = SaltTheme.textStyles.sub.copy(
+                    color = if (enabled) colors.text else colors.subText,
+                    fontWeight = FontWeight.Medium
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
+        Switcher(state = checked)
     }
 }
 
@@ -445,7 +634,12 @@ private fun InlinePicker(
     }
 }
 
-internal data class SpwPlaylistTrack(val item: MediaItem, val syncTrackId: String)
+internal data class SpwPlaylistTrack(
+    val item: MediaItem,
+    val syncTrackId: String,
+    val memberIndex: Int = 0,
+    val rowKey: String = syncTrackId
+)
 internal data class PlaylistMember(val syncTrackId: String, val path: String?)
 
 internal enum class PlaylistScanMode(val label: String, val description: String, val suffix: String?) {
@@ -685,6 +879,69 @@ private fun PlaylistTrackDetails(duration: Long, metadata: TrackAnalysisMetadata
     }
 }
 
+@Composable
+private fun SavedTransitionRow(
+    itemA: MediaItem,
+    itemB: MediaItem,
+    plan: Plan?,
+    selected: Boolean,
+    covers: PlaylistCoverStore,
+    onSelect: () -> Unit
+) {
+    val skin = LocalSkin.current
+    val shape = RoundedCornerShape(10.dp)
+    var hovered by remember(itemA.id, itemB.id) { mutableStateOf(false) }
+    val background = when {
+        selected -> skin.accent.copy(alpha = if (skin.isDark) 0.22f else 0.10f).compositeOver(skin.surface)
+        hovered -> if (skin.pageBackground.alpha < 1f) skin.hover else skin.hover.copy(alpha = 0.45f).compositeOver(skin.surface)
+        else -> skin.surface
+    }
+    val border = if (selected) skin.accent.copy(alpha = 0.55f) else skin.line
+    Row(
+        Modifier.fillMaxWidth().clip(shape)
+            .onPointerEvent(PointerEventType.Enter) { hovered = true }
+            .onPointerEvent(PointerEventType.Exit) { hovered = false }
+            .background(background)
+            .border(1.dp, border, shape)
+            .clickable(role = Role.RadioButton, onClick = onSelect)
+            .semantics { this[SemanticsProperties.Selected] = selected }
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            for (track in listOf(itemA, itemB)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    PlaylistCover(track.id, covers, 24.dp)
+                    BasicText(
+                        track.title,
+                        style = skin.sub.copy(color = skin.text, fontWeight = FontWeight.Medium),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+        if (plan != null) {
+            Column(
+                Modifier.widthIn(max = 88.dp),
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                BasicText(
+                    planName(plan),
+                    style = skin.sub.copy(color = if (selected) skin.accent else skin.text, fontSize = 11.sp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (plan.hasOverlap) {
+                    BasicText("${plan.bars} 小节", style = skin.sub.copy(color = skin.muted, fontSize = 11.sp), maxLines = 1)
+                }
+            }
+        }
+    }
+}
+
 internal data class SpwPlaylist(
     val id: String,
     val title: String,
@@ -694,24 +951,21 @@ internal data class SpwPlaylist(
     val descending: Boolean = false
 )
 
-private fun fmtTime(s: Double): String {
-    val sign = if (s < 0.0) "-" else ""
-    val safe = abs(s)
-    return "$sign%d:%06.3f".format(java.util.Locale.ROOT, safe.toInt() / 60, safe % 60.0)
-}
-
 private fun fmtClock(sec: Double): String {
     val total = max(0, sec.roundToInt())
     return "%d:%02d".format(java.util.Locale.ROOT, total / 60, total % 60)
 }
 
-private fun planSummary(p: Plan): String {
-    if (p.useHost) return "沿用 SPW"
-    val label = Plan.presets.firstOrNull { it.matches(p) }?.label
-        ?: Plan.volumes[p.volume]
-        ?: "自定义"
-    return "$label · ${p.bars} 小节"
+private val Plan.hasOverlap get() = !useHost && !noMix
+
+private fun planName(p: Plan): String = when {
+    p.useHost -> "沿用 SPW"
+    p.noMix -> "无过渡效果"
+    else -> Plan.presets.firstOrNull { it.matches(p) }?.label ?: Plan.volumes[p.volume] ?: "自定义"
 }
+
+private fun planSummary(p: Plan): String =
+    if (p.hasOverlap) "${planName(p)} · ${p.bars} 小节" else planName(p)
 
 private fun nearestIn(arr: DoubleArray, target: Double): Pair<Double, Double>? {
     if (arr.isEmpty()) return null
@@ -724,10 +978,12 @@ private fun nearestIn(arr: DoubleArray, target: Double): Pair<Double, Double>? {
     return nearest to abs(nearest - target)
 }
 
-private fun usesMovableSwap(plan: Plan): Boolean {
-    if (plan.eq == "bass-swap" || plan.eq == "fast-bass-cut") return true
-    if (plan.eq == "bass-swap-start" || plan.eq == "bass-swap-end") return false
-    return plan.filter != "none" || plan.volume in setOf("fade-cut", "cut-fade", "overlap", "mid-cut")
+private fun usesMovableSwap(plan: Plan): Boolean = plan.usesSwap
+
+private fun swapRange(window: TransitionWindow?): ClosedFloatingPointRange<Double> {
+    val lo = max(0.05, window?.phaseStart ?: 0.05)
+    val hi = min(0.95, window?.phaseEnd ?: 0.95)
+    return if (hi - lo >= 0.02) lo..hi else 0.05..0.95
 }
 
 private const val maxDownbeatSnapSeconds = 0.045
@@ -811,6 +1067,32 @@ private fun snapCue(
         ?: localBeat(moving.beats, beatTolSec, "仅吸附本轨拍点")
 }
 
+private suspend fun PointerInputScope.detectHistoryDragGestures(
+    onDragStart: (Offset) -> Unit,
+    onDragEnd: () -> Unit,
+    onDrag: (PointerInputChange, Offset) -> Unit,
+) {
+    var dragging = false
+    fun finish() {
+        if (!dragging) return
+        dragging = false
+        onDragEnd()
+    }
+    try {
+        detectDragGestures(
+            onDragStart = {
+                dragging = true
+                onDragStart(it)
+            },
+            onDragEnd = ::finish,
+            onDragCancel = ::finish,
+            onDrag = onDrag,
+        )
+    } finally {
+        finish()
+    }
+}
+
 @Composable
 private fun StackedTimelineMinimap(
     waveA: TrackWaves,
@@ -819,10 +1101,12 @@ private fun StackedTimelineMinimap(
     palette: StagePalette,
     skin: Skin,
     onJumpCue: (idx: Int, rawSec: Double, snap: Boolean) -> Unit,
+    onDragStart: () -> Unit = {},
     onDragEnd: () -> Unit
 ) {
     val curPlan by rememberUpdatedState(plan)
     val mover by rememberUpdatedState(onJumpCue)
+    val startDrag by rememberUpdatedState(onDragStart)
     val endDrag by rememberUpdatedState(onDragEnd)
     val envelopeA = remember(waveA.peaks) { WaveformEnvelope(waveA.peaks, useRms = true) }
     val envelopeB = remember(waveB.peaks) { WaveformEnvelope(waveB.peaks, useRms = true) }
@@ -842,13 +1126,15 @@ private fun StackedTimelineMinimap(
             .border(0.5.dp, skin.line, RoundedCornerShape(8.dp))
             .pointerInput(waveA, waveB) {
                 detectTapGestures { pos ->
+                    if (size.width <= 0) return@detectTapGestures
                     val p = curPlan
                     val pMin = (p.cueA + p.duration * 0.5) - halfSpan
                     val tHit = pMin + (pos.x / size.width) * totalSpan
+                    val halfDur = p.duration * 0.5
                     if (pos.y <= size.height / 2f) {
-                        mover(0, tHit, true)
+                        mover(0, tHit - halfDur, true)
                     } else {
-                        mover(1, tHit - (p.cueA - p.cueB), true)
+                        mover(1, tHit - halfDur - (p.cueA - p.cueB), true)
                     }
                 }
             }
@@ -856,24 +1142,27 @@ private fun StackedTimelineMinimap(
                 var dragIdx = 0
                 var dragStartCue = 0.0
                 var cumDx = 0f
-                detectDragGestures(
+                detectHistoryDragGestures(
                     onDragStart = { start ->
+                        startDrag()
                         dragIdx = if (start.y <= size.height / 2f) 0 else 1
                         dragStartCue = if (dragIdx == 0) curPlan.cueA else curPlan.cueB
                         cumDx = 0f
                     },
-                    onDragEnd = { endDrag() },
-                    onDragCancel = { endDrag() }
+                    onDragEnd = { endDrag() }
                 ) { change, delta ->
+                    if (size.width <= 0) return@detectHistoryDragGestures
                     change.consume()
                     cumDx += delta.x
                     val rawCue = dragStartCue - (cumDx / size.width) * totalSpan
-                    mover(dragIdx, rawCue, false)
+                    mover(dragIdx, rawCue, curPlan.snap)
                 }
             }
     ) {
         val w = size.width
         val h = size.height
+        val edgeInset = 1.dp.toPx()
+        if (w <= 0f || h <= 2 * edgeInset) return@Canvas
         val halfH = h / 2f
         clipRect {
             drawPath(envelopeA.path(tMin, totalSpan, w, halfH * 0.5f, halfH * 0.38f), palette.overviewPeak)
@@ -883,14 +1172,14 @@ private fun StackedTimelineMinimap(
 
         drawLine(skin.line.copy(alpha = 0.6f), Offset(0f, halfH), Offset(w, halfH), 0.5.dp.toPx())
 
-        val winW = (plan.duration / totalSpan * w).toFloat().coerceAtLeast(16.dp.toPx())
-        val winX = (w * 0.5f - winW * 0.5f).coerceIn(0f, w - winW)
+        val winW = maxOf((plan.duration / totalSpan * w).toFloat(), 16.dp.toPx()).coerceAtMost(w)
+        val winX = (w - winW) * 0.5f
         val cr = CornerRadius(4.dp.toPx(), 4.dp.toPx())
-        drawRoundRect(palette.overviewWin, Offset(winX, 1.dp.toPx()), Size(winW, h - 2.dp.toPx()), cr)
+        drawRoundRect(palette.overviewWin, Offset(winX, edgeInset), Size(winW, h - 2 * edgeInset), cr)
         drawRoundRect(
             skin.accent.copy(alpha = 0.72f),
-            Offset(winX, 1.dp.toPx()),
-            Size(winW, h - 2.dp.toPx()),
+            Offset(winX, edgeInset),
+            Size(winW, h - 2 * edgeInset),
             cr,
             style = Stroke(width = 1.2.dp.toPx())
         )
@@ -984,10 +1273,9 @@ private fun BeatGridSeam(
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun DeckStage(
-    titleA: String,
-    artistA: String,
-    titleB: String,
-    artistB: String,
+    trackA: MediaItem,
+    trackB: MediaItem,
+    covers: PlaylistCoverStore,
     waveA: TrackWaves,
     waveB: TrackWaves,
     deckHeight: Dp,
@@ -1006,16 +1294,30 @@ private fun DeckStage(
     rendering: Boolean,
     onToggleAudition: () -> Unit,
     onUpdate: (Plan) -> Unit,
-    onSeekPreview: (Double) -> Unit
+    onEditStart: () -> Unit,
+    onEditEnd: () -> Unit,
+    onSeekPreview: (Double) -> Unit,
+    editActions: @Composable () -> Unit
 ) {
     val skin = LocalSkin.current
     val palette = remember(skin) { stagePalette(skin) }
     val curPlan by rememberUpdatedState(editPlan)
     val gainKnots = remember(plan, audibleWindow) { audibleWindow?.gains(plan).orEmpty() }
     val setter by rememberUpdatedState(onUpdate)
+    val beginEdit by rememberUpdatedState(onEditStart)
+    val endEdit by rememberUpdatedState(onEditEnd)
     val seeker by rememberUpdatedState(onSeekPreview)
     val snapOn by rememberUpdatedState(snapEnabled)
     var activeSnapMsg by remember { mutableStateOf<String?>(null) }
+    var draggingDeck by remember { mutableStateOf(false) }
+    var snapMsgSeq by remember { mutableStateOf(0) }
+
+    LaunchedEffect(activeSnapMsg, snapMsgSeq, draggingDeck) {
+        if (activeSnapMsg != null && !draggingDeck) {
+            delay(2000L)
+            activeSnapMsg = null
+        }
+    }
 
     fun moveCue(idx: Int, pos: Double, p: Plan): Plan {
         val clamped = pos.coerceIn(p.cueBounds(idx, lengthA, lengthB))
@@ -1026,15 +1328,18 @@ private fun DeckStage(
     fun TrackInfoRow(
         idx: Int,
         tw: TrackWaves,
-        title: String,
-        artist: String,
-        colorTag: Color
+        track: MediaItem
     ) {
         val cue = if (idx == 0) plan.cueA else plan.cueB
         val bpm = if (idx == 0) plan.bpmA else plan.bpmB
+        val cueLabel = when {
+            idx == 1 && cue <= -1.0 -> "0:00（延迟 ${(-cue).toInt()} 秒）"
+            idx == 1 && cue < -0.05 -> "0:00（延迟不到 1 秒）"
+            else -> fmtClock(floor(cue))
+        }
         Row(
             Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(
@@ -1042,17 +1347,28 @@ private fun DeckStage(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Box(Modifier.size(8.dp).clip(RoundedCornerShape(4.dp)).background(colorTag))
+                PlaylistCover(track.id, covers, playlistCoverSize)
+                Column(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    BasicText(
+                        track.title,
+                        style = skin.sub.copy(color = skin.text, fontWeight = FontWeight.Medium),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (track.artist.isNotBlank()) {
+                        BasicText(
+                            track.artist,
+                            style = skin.sub.copy(color = skin.muted, fontSize = 11.sp),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
                 BasicText(
-                    if (artist.isBlank()) title else "$title · $artist",
-                    modifier = Modifier.weight(1f, fill = false),
-                    style = skin.sub.copy(color = skin.text, fontWeight = FontWeight.Medium),
+                    cueLabel,
+                    style = skin.sub.copy(color = skin.muted),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
-                )
-                BasicText(
-                    fmtTime(cue),
-                    style = skin.sub.copy(color = skin.muted)
                 )
             }
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1101,6 +1417,7 @@ private fun DeckStage(
                 .semantics { contentDescription = if (idx == 0) "拖动A轨波形调整退出点" else "拖动B轨波形调整进入点" }
                 .pointerInput(idx, tw) {
                     detectTapGestures { pos ->
+                        if (size.width <= 0) return@detectTapGestures
                         val p = (pos.x / size.width - 0.12f) / 0.76f
                         seeker(p * curPlan.duration)
                     }
@@ -1110,28 +1427,39 @@ private fun DeckStage(
                     var dragStartSwap = 0.5
                     var draggingSwap = false
                     var cumDx = 0f
-                    detectDragGestures(
+                    detectHistoryDragGestures(
                         onDragStart = { startOffset ->
+                            beginEdit()
+                            draggingDeck = true
                             dragStartCue = if (idx == 0) curPlan.cueA else curPlan.cueB
-                            dragStartSwap = curPlan.swap
+                            val range = swapRange(curPlan.window(lengthA, lengthB))
+                            dragStartSwap = curPlan.swap.coerceIn(range)
                             cumDx = 0f
-                            val sx = (0.12f + 0.76f * curPlan.swap.toFloat()) * size.width
+                            val sx = (0.12f + 0.76f * dragStartSwap.toFloat()) * size.width
+                            val hitX = 18.dp.toPx()
+                            val hitY = 20.dp.toPx()
+                            val nearHandleEdge = if (idx == 0) startOffset.y < hitY else startOffset.y > size.height - hitY
                             draggingSwap = usesMovableSwap(curPlan) &&
-                                abs(startOffset.x - sx) < 22f && (startOffset.y < 24f || startOffset.y > size.height - 24f)
+                                abs(startOffset.x - sx) < hitX && nearHandleEdge
                         },
-                        onDragEnd = { activeSnapMsg = null },
-                        onDragCancel = { activeSnapMsg = null }
+                        onDragEnd = {
+                            draggingDeck = false
+                            activeSnapMsg = null
+                            endEdit()
+                        }
                     ) { change, delta ->
+                        if (size.width <= 0) return@detectHistoryDragGestures
                         change.consume()
                         cumDx += delta.x
                         val mixWidth = size.width * 0.76
                         if (draggingSwap) {
-                            var rawSwap = (dragStartSwap + cumDx / mixWidth).coerceIn(0.05, 0.95)
+                            val range = swapRange(curPlan.window(lengthA, lengthB))
+                            var rawSwap = (dragStartSwap + cumDx / mixWidth).coerceIn(range)
                             var snapMsg: String? = null
                             if (snapOn) {
                                 for (k in 1 until curPlan.bars) {
                                     val anchor = k.toDouble() / curPlan.bars
-                                    if (abs(rawSwap - anchor) * mixWidth <= 6.dp.toPx()) {
+                                    if (anchor in range && abs(rawSwap - anchor) * mixWidth <= 6.dp.toPx()) {
                                         rawSwap = anchor
                                         snapMsg = if (k * 2 == curPlan.bars) "已吸附中点 50%" else "已吸附第 $k 小节"
                                         break
@@ -1235,30 +1563,48 @@ private fun DeckStage(
                 }
                 plotCurve(TransitionParameter.VOLUME, palette.curveVol, gains)
                 if (plan.eq != "none") {
-                    plotCurve(TransitionParameter.EQ, palette.curveEq, audibleWindow.eqKnots(plan, idx).map { (progress, db) ->
-                        audibleWindow.phase(progress) to (0.08 + 0.42 * 10.0.pow(db / 20.0))
-                    })
+                    val bands = if (plan.previewOnlyEq) EqBand.entries.asReversed() else listOf(EqBand.Low)
+                    for (band in bands) {
+                        val color = when (band) {
+                            EqBand.Low -> palette.curveEq
+                            EqBand.Mid -> palette.curveEq.copy(alpha = 0.72f)
+                            EqBand.High -> palette.curveEq.copy(alpha = 0.48f)
+                        }
+                        val knots = audibleWindow.eqKnots(plan, idx, band)
+                        plotCurve(TransitionParameter.EQ, color, knots.map { (progress, db) ->
+                            audibleWindow.phase(progress) to (0.08 + 0.42 * 10.0.pow(db / 20.0))
+                        })
+                    }
                 } else if (emphasizedParameter == TransitionParameter.EQ) {
                     plotCurve(TransitionParameter.EQ, palette.curveEq, flat)
                 }
-                if (plan.filter != "none") {
-                    val range = ln(Plan.HOST_LPF_MAX_HZ / Plan.HOST_LPF_MIN_HZ)
+                val sweep = plan.filterSweep(idx)
+                if (sweep != null) {
+                    val direction = if (sweep.lowPass) -0.40 else 0.40
                     plotCurve(TransitionParameter.FILTER, palette.curveFilter, audibleWindow.filterKnots(plan, idx).map { (progress, hz) ->
-                        audibleWindow.phase(progress) to (0.10 + 0.40 * ln(hz / Plan.HOST_LPF_MIN_HZ) / range)
+                        audibleWindow.phase(progress) to (0.50 + direction * sweep.strengthAt(hz))
                     })
+                } else if (plan.noiseTail && idx == 0) {
+                    val points = (0..32).map { step ->
+                        val progress = audibleWindow.phase(step / 32.0)
+                        progress to (0.50 + (10.0 * Plan.noiseGain(progress)).coerceAtMost(0.40))
+                    }
+                    plotCurve(TransitionParameter.FILTER, palette.curveFilter, points)
                 } else if (emphasizedParameter == TransitionParameter.FILTER) {
                     plotCurve(TransitionParameter.FILTER, palette.curveFilter, flat)
                 }
-                if (idx == 0 && (plan.echo || emphasizedParameter == TransitionParameter.EFFECT)) {
-                    val wet = if (plan.echo) audibleWindow.echoWetKnots() else listOf(0.0 to 0.0, 1.0 to 0.0)
+                if (idx == 0 && (plan.effect != TransitionEffect.None || emphasizedParameter == TransitionParameter.EFFECT)) {
+                    val wet = audibleWindow.effectKnots(plan.effect)
+                    val scale = if (plan.effect.reverb) 0.4 else 1.0
                     plotCurve(TransitionParameter.EFFECT, skin.muted, wet.map { (progress, level) ->
-                        audibleWindow.phase(progress) to (0.10 + level)
+                        audibleWindow.phase(progress) to (0.10 + scale * level)
                     })
                 }
             }
 
             if (usesMovableSwap(plan)) {
-                val sx = mixL + mixW * plan.swap.toFloat()
+                val displaySwap = plan.swap.coerceIn(swapRange(audibleWindow))
+                val sx = mixL + mixW * displaySwap.toFloat()
                 val handleAlpha = opacity(
                     if (plan.eq != "none") TransitionParameter.EQ
                     else if (plan.filter != "none") TransitionParameter.FILTER
@@ -1302,41 +1648,70 @@ private fun DeckStage(
                     snapCue(idx, clamped, minC, maxC, curPlan, waveA, waveB, maxDownbeatSnapSeconds, maxBeatSnapSeconds)
                 } else null
                 activeSnapMsg = hit?.second
+                snapMsgSeq++
                 setter(moveCue(idx, hit?.first ?: clamped, curPlan))
             },
-            onDragEnd = { activeSnapMsg = null }
+            onDragStart = {
+                beginEdit()
+                draggingDeck = true
+            },
+            onDragEnd = {
+                draggingDeck = false
+                activeSnapMsg = null
+                endEdit()
+            }
         )
 
         // 2. Track A info row directly above Deck A.
-        TrackInfoRow(0, waveA, titleA, artistA, palette.curveVol)
+        TrackInfoRow(0, waveA, trackA)
 
         // 3. Panoramic Dual-Deck Well with center Play/Stop and bottom Bar pill.
         val wellShape = RoundedCornerShape(10.dp)
+        val glassReady = !LocalAutoMixPageEntering.current && !LocalAutoMixPageClosing.current
+        val stageGlass = rememberGlassSource()
         Box(
             Modifier
                 .fillMaxWidth()
                 .clip(wellShape)
-                .border(0.5.dp, skin.line, wellShape)
+                .border(1.dp, skin.line, wellShape)
         ) {
-            Column(Modifier.fillMaxWidth()) {
+            Column(Modifier.fillMaxWidth().then(if (glassReady) Modifier.glassSource(stageGlass) else Modifier)) {
                 DeckCanvas(0, waveA)
                 BeatGridSeam(waveA, waveB, plan, palette, skin, playheadSec, previewMixStart)
                 DeckCanvas(1, waveB)
             }
 
-            // Center Floating Audition Pill (Play triangle / Stop square).
-            val btnShape = RoundedCornerShape(8.dp)
-            Box(
-                Modifier
+            // Center Floating Audition Pill (Play triangle / Stop square) with SaltUI Glass.
+            val btnShape = RoundedCornerShape(10.dp)
+            var auditionHovered by remember { mutableStateOf(false) }
+            BasicButton(
+                onClick = onToggleAudition,
+                modifier = Modifier
                     .align(Alignment.Center)
-                    .width(38.dp)
-                    .height(28.dp)
-                    .clip(btnShape)
-                    .background(skin.popupBackground())
-                    .border(0.8.dp, skin.line, btnShape)
-                    .clickable(enabled = canAudition, onClick = onToggleAudition)
+                    .width(42.dp)
+                    .height(30.dp)
+                    .then(if (glassReady) Modifier.glass(stageGlass, shape = btnShape) else Modifier)
+                    .onPointerEvent(PointerEventType.Enter) { auditionHovered = true }
+                    .onPointerEvent(PointerEventType.Exit) { auditionHovered = false }
                     .semantics { contentDescription = if (isPlaying || rendering) "停止试听" else "试听过渡" },
-                contentAlignment = Alignment.Center
+                enabled = canAudition,
+                size = ControlSize.Small,
+                shape = btnShape,
+                colors = ButtonColors(
+                    containerColor = when {
+                        glassReady && auditionHovered && canAudition -> skin.hover.copy(alpha = 0.45f)
+                        glassReady -> Color.Transparent
+                        auditionHovered && canAudition -> skin.hover.compositeOver(skin.popupBackground())
+                        else -> skin.popupBackground().copy(alpha = 0.94f)
+                    },
+                    contentColor = skin.text,
+                    disabledContainerColor = if (glassReady) Color.Transparent else skin.popupBackground(),
+                    disabledContentColor = skin.muted
+                ),
+                border = if (glassReady) BorderStroke(0.5.dp, SolidColor(skin.line.copy(alpha = 0.65f)))
+                    else BorderStroke(1.dp, SolidColor(skin.line)),
+                contentPadding = PaddingValues(0.dp),
+                indication = null
             ) {
                 Canvas(Modifier.size(12.dp)) {
                     val w = size.width
@@ -1360,15 +1735,27 @@ private fun DeckStage(
                 }
             }
 
-            // Bottom-Center Floating Bar Count Pill (cycles 2 -> 4 -> 8 -> 2).
-            val barShape = RoundedCornerShape(999.dp)
+            // Bottom-Center Floating Bar Count Pill (cycles 2 -> 4 -> 8 -> 2) with SaltUI Glass.
+            val barShape = RoundedCornerShape(14.dp)
+            var barHovered by remember { mutableStateOf(false) }
             Box(
                 Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 6.dp)
+                    .then(if (glassReady) Modifier.glass(stageGlass, shape = barShape) else Modifier)
                     .clip(barShape)
-                    .background(skin.popupBackground())
-                    .border(0.8.dp, skin.line, barShape)
+                    .onPointerEvent(PointerEventType.Enter) { barHovered = true }
+                    .onPointerEvent(PointerEventType.Exit) { barHovered = false }
+                    .background(when {
+                        glassReady && barHovered -> skin.hover.copy(alpha = 0.45f)
+                        glassReady -> Color.Transparent
+                        else -> skin.popupBackground().copy(alpha = 0.92f)
+                    })
+                    .border(
+                        if (glassReady) 0.5.dp else 0.8.dp,
+                        if (glassReady) skin.line.copy(alpha = 0.65f) else skin.line,
+                        barShape
+                    )
                     .clickable {
                         val nextBars = when (curPlan.bars) {
                             2 -> 4
@@ -1387,18 +1774,26 @@ private fun DeckStage(
         }
 
         // 4. Track B info row directly below Deck B.
-        TrackInfoRow(1, waveB, titleB, artistB, palette.curveFilter)
+        TrackInfoRow(1, waveB, trackB)
 
-        FlowRow(
+        Row(
             Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalArrangement = Arrangement.spacedBy(3.dp)
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            val effectLegend = if (plan.echo || emphasizedParameter == TransitionParameter.EFFECT) " · 灰回声" else ""
-            Label("波形：蓝低频 · 橙中频 · 白高频  |  曲线：青音量 · 黄低音 · 紫低通$effectLegend", small = true)
-            (activeSnapMsg ?: tempoPair)?.let { msg ->
-                BasicText(msg, style = skin.sub.copy(color = skin.accent, fontWeight = FontWeight.Medium))
+            FlowRow(
+                Modifier.weight(1f),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                val effectLegend = if (plan.effect != TransitionEffect.None || emphasizedParameter == TransitionParameter.EFFECT) " · 灰效果" else ""
+                val swapLegend = if (usesMovableSwap(plan)) " · 竖线拖动调交接点" else ""
+                Label("波形：蓝低频 · 橙中频 · 白高频  |  曲线：青音量 · 黄均衡 · 紫滤波$effectLegend$swapLegend", small = true)
+                (activeSnapMsg ?: tempoPair)?.let { msg ->
+                    BasicText(msg, style = skin.sub.copy(color = skin.accent, fontWeight = FontWeight.Medium))
+                }
             }
+            editActions()
         }
     }
 }
@@ -1416,48 +1811,64 @@ private fun EditorHeader(
     Row(
         Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 10.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
+            .height(56.dp)
+            .padding(start = if (onBack != null) 12.dp else 16.dp, end = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(
+            Modifier.weight(1f),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
             if (onBack != null) {
-                Box(
-                    Modifier
-                        .size(32.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onBack),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Canvas(Modifier.size(16.dp)) {
-                        val w = size.width
-                        val h = size.height
-                        val strokeWidth = 1.8.dp.toPx()
-                        drawLine(skin.text, Offset(w * 0.20f, h * 0.50f), Offset(w * 0.85f, h * 0.50f), strokeWidth)
-                        drawLine(skin.text, Offset(w * 0.20f, h * 0.50f), Offset(w * 0.48f, h * 0.22f), strokeWidth)
-                        drawLine(skin.text, Offset(w * 0.20f, h * 0.50f), Offset(w * 0.48f, h * 0.78f), strokeWidth)
-                    }
-                }
+                BasicScreenDefaults.BackButton(
+                    onBack = onBack,
+                    modifier = Modifier.semantics { contentDescription = "返回" }
+                )
             }
-            BasicText(
+            SaltText(
                 "AutoMix",
-                style = skin.main.copy(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = skin.text)
+                fontSize = 24.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
-            Box(
+            var statusHovered by remember { mutableStateOf(false) }
+            Row(
                 Modifier
-                    .clip(RoundedCornerShape(7.dp))
-                    .background(skin.surface)
+                    .weight(1f, fill = false)
+                    .clip(skin.smallShape)
+                    .onPointerEvent(PointerEventType.Enter) { statusHovered = true }
+                    .onPointerEvent(PointerEventType.Exit) { statusHovered = false }
+                    .background(if (statusHovered) skin.hover else Color.Transparent)
                     .clickable { MainPlugin.showStatus() }
-                    .padding(horizontal = 10.dp, vertical = 4.dp)
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                BasicText(plugin.status, style = skin.sub.copy(color = skin.muted))
+                val activeDot = plugin.bridge != null
+                Box(Modifier.size(6.dp).clip(CircleShape).background(if (activeDot) skin.success else skin.muted.copy(alpha = 0.5f)))
+                BasicText(
+                    plugin.status,
+                    style = skin.sub.copy(color = skin.muted),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
             if (statusText.isNotBlank()) {
-                Label(statusText, small = true)
+                BasicText(
+                    statusText,
+                    modifier = Modifier.widthIn(max = 220.dp).padding(end = 4.dp),
+                    style = skin.sub.copy(color = skin.muted),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
             actions()
+            plugin.updates?.let { AutoMixAboutAction(plugin.pluginContext.pluginVersion, it) }
         }
     }
 }
@@ -1468,63 +1879,122 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
     val scope = rememberCoroutineScope()
     val savedPlans by plugin.plans.collectAsState()
     val host by plugin.hosts.collectAsState()
+    val saltColors = remember(skin) { skin.toSaltColors() }
+    val saltTextStyles = remember(skin) {
+        SaltTextStyles(
+            main = skin.main,
+            sub = skin.sub,
+            paragraph = skin.paragraph,
+            largeTitle = skin.largeTitle
+        )
+    }
+    val saltShapes = remember(skin) {
+        SaltShapes(
+            small = skin.smallShape,
+            medium = skin.cardShape,
+            large = skin.largeShape
+        )
+    }
+    SaltTheme(
+        configs = SaltConfigs.default(isDarkTheme = skin.isDark),
+        dynamicColors = SaltDynamicColors(light = saltColors, dark = saltColors),
+        textStyles = saltTextStyles,
+        shapes = saltShapes
+    ) {
     CompositionLocalProvider(LocalSkin provides skin) {
-        var library by remember { mutableStateOf(emptyList<MediaItem>()) }
-        var queue by remember { mutableStateOf(QueueView()) }
+        val cache = plugin.uiCache
+        val pageEntering = LocalAutoMixPageEntering.current
+        val pageClosing = LocalAutoMixPageClosing.current
+        val canCommitState by rememberUpdatedState(!pageEntering && !pageClosing)
+
+        var library by remember(cache) { mutableStateOf(cache.library) }
+        var queue by remember(cache) { mutableStateOf(cache.queue) }
         val queueEntries = queue.entries
         val queueTracks = remember(queueEntries) { queueEntries.map { it.item } }
-        var playlists by remember { mutableStateOf(emptyList<SpwPlaylist>()) }
-        var selectedPlaylistId by remember { mutableStateOf<String?>(null) }
+        var playlists by remember(cache) { mutableStateOf(cache.playlists) }
+        var selectedPlaylistId by remember(cache) { mutableStateOf(cache.selectedPlaylistId) }
         var playlistNote by remember { mutableStateOf("") }
         var scanJob by remember { mutableStateOf<Job?>(null) }
         var scanProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
         var writingPlaylist by remember { mutableStateOf(false) }
         var scanNote by remember { mutableStateOf("") }
-        var a by remember { mutableStateOf<MediaItem?>(null) }
-        var b by remember { mutableStateOf<MediaItem?>(null) }
-        var playlistTab by remember { mutableStateOf("queue") }
+        var a by remember(cache) { mutableStateOf(cache.selectedA) }
+        var b by remember(cache) { mutableStateOf(cache.selectedB) }
+        var playlistTab by remember(cache) { mutableStateOf(cache.playlistTab) }
         val queueScroll = rememberLazyListState()
         val playlistScroll = if (playlistTab == "queue") queueScroll else key(
             playlistTab, selectedPlaylistId.takeIf { playlistTab == "playlists" }
         ) {
             rememberLazyListState()
         }
-        val trackMetadata = remember(plugin) { mutableStateMapOf<String, TrackAnalysisMetadata>() }
+        val trackMetadata = cache.trackMetadata
         var metadataRevision by remember { mutableStateOf(0) }
-        val covers = remember(plugin, metadataRevision) { PlaylistCoverStore() }
-        var message by remember { mutableStateOf("正在读取队列与曲库…") }
+        val covers = cache.covers
+        var message by remember(cache) { mutableStateOf(if (cache.initialized) "" else "正在读取队列与曲库…") }
         var queueNote by remember { mutableStateOf("") }
-        var refreshing by remember { mutableStateOf(true) }
+        var refreshing by remember(cache) { mutableStateOf(!cache.initialized) }
         var movingQueue by remember { mutableStateOf(false) }
+        var movingPlaylist by remember { mutableStateOf(false) }
+        var selectedPairKeys by remember(cache) { mutableStateOf(cache.selectedPairKeys) }
 
-        fun selectPair(pair: Pair<MediaItem, MediaItem>) {
+        fun selectPair(pair: Pair<MediaItem, MediaItem>, keys: Pair<String, String>? = null) {
             a = pair.first
             b = pair.second
+            selectedPairKeys = keys
+            cache.selectedA = pair.first
+            cache.selectedB = pair.second
+            cache.selectedPairKeys = keys
         }
 
-        suspend fun loadSpwPlaylists(tracks: List<MediaItem>) {
-            if (tracks.isEmpty()) {
-                playlists = playlists.map { playlist ->
-                    playlist.copy(tracks = emptyList(), members = playlist.members.map { it.copy(path = null) })
-                }
-            }
-            val bridge = host ?: return
-            try {
+        fun selectTab(tab: String) {
+            playlistTab = tab
+            cache.playlistTab = tab
+        }
+
+        suspend fun awaitMotionSettled() {
+            if (!canCommitState) snapshotFlow { canCommitState }.first { it }
+        }
+
+        suspend fun buildSpwPlaylists(bridge: HostPlayback, tracks: List<MediaItem>): List<SpwPlaylist> =
+            withContext(Dispatchers.IO) {
                 val sources = bridge.loadPlaylists()
-                val currentTracks = library
-                val byId = currentTracks.associateBy { it.id }
-                val byPath = currentTracks.associateBy { normPathStr(it.path) }
-                val parsed = sources.map { source ->
+                val byId = tracks.associateBy { it.id }
+                val byPath = tracks.associateBy { normPathStr(it.path) }
+                sources.map { source ->
                     val entries = source.tracks.map { track ->
                         val item = (track.id?.let(byId::get)) ?: track.path?.let { byPath[normPathStr(it)] }
                         PlaylistMember(track.syncTrackId, item?.path ?: track.path?.takeIf { it.isNotBlank() }) to item
                     }
-                    val mapped = entries.mapNotNull { (entry, item) -> item?.let { SpwPlaylistTrack(it, entry.syncTrackId) } }
+                    val seenSyncIds = mutableMapOf<String, Int>()
+                    val mapped = entries.mapIndexedNotNull { memberIndex, (entry, item) ->
+                        item?.let {
+                            val occurrence = seenSyncIds[entry.syncTrackId] ?: 0
+                            seenSyncIds[entry.syncTrackId] = occurrence + 1
+                            SpwPlaylistTrack(it, entry.syncTrackId, memberIndex, "${entry.syncTrackId}#$occurrence")
+                        }
+                    }
                     SpwPlaylist(source.id, source.title, mapped, entries.map { it.first }, source.sort, source.descending)
                 }
+            }
+
+        suspend fun loadSpwPlaylists(tracks: List<MediaItem>) {
+            if (tracks.isEmpty()) {
+                val cleared = playlists.map { playlist ->
+                    playlist.copy(tracks = emptyList(), members = playlist.members.map { it.copy(path = null) })
+                }
+                playlists = cleared
+                cache.playlists = cleared
+            }
+            val bridge = host ?: return
+            try {
+                val parsed = buildSpwPlaylists(bridge, tracks)
+                awaitMotionSettled()
                 playlists = parsed
+                cache.playlists = parsed
                 if (selectedPlaylistId == null || parsed.none { it.id == selectedPlaylistId }) {
-                    selectedPlaylistId = (parsed.firstOrNull { it.tracks.size >= 2 } ?: parsed.firstOrNull())?.id
+                    val nextId = (parsed.firstOrNull { it.tracks.size >= 2 } ?: parsed.firstOrNull())?.id
+                    selectedPlaylistId = nextId
+                    cache.selectedPlaylistId = nextId
                 }
                 playlistNote = ""
             } catch (e: Exception) {
@@ -1533,21 +2003,43 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        suspend fun refreshLists(selectInitialPair: Boolean) {
-            refreshing = true
+        suspend fun refreshLists(selectInitialPair: Boolean, deferCommit: Boolean = false) {
+            if (!cache.initialized || !deferCommit) refreshing = true
             try {
-                val tracks = withContext(Dispatchers.IO) {
-                    WorkshopApi.library.getAllTracks().toCompletableFuture().get()
-                        .filter { it.path.isNotBlank() && it.id.isNotBlank() }
-                }
-                library = tracks
                 val bridge = host
-                if (bridge != null) {
-                    queue = bridge.queueView(bridge.queueStates().value, tracks)
-                    if (selectInitialPair && a == null && b == null) queue.nextPair?.let(::selectPair)
+                val fetched = withContext(Dispatchers.IO) {
+                    val tracks = WorkshopApi.library.getAllTracks().toCompletableFuture().get()
+                        .filter { it.path.isNotBlank() && it.id.isNotBlank() }
+                    val nextQueue = bridge?.let { it.queueView(it.queueStates().value, tracks) }
+                    val nextPlaylists = bridge?.let { runCatching { buildSpwPlaylists(it, tracks) } }
+                    Triple(tracks, nextQueue, nextPlaylists)
+                }
+                if (deferCommit) awaitMotionSettled()
+                val (tracks, nextQueue, nextPlaylists) = fetched
+                library = tracks
+                cache.library = tracks
+                cache.initialized = true
+                if (nextQueue != null) {
+                    queue = nextQueue
+                    cache.queue = nextQueue
+                    if (selectInitialPair && a == null && b == null) nextQueue.nextPair?.let { selectPair(it) }
                 }
                 message = if (tracks.size < 2) "曲库不足两首歌曲" else ""
-                loadSpwPlaylists(tracks)
+                if (nextPlaylists != null) {
+                    nextPlaylists.onSuccess { parsed ->
+                        playlists = parsed
+                        cache.playlists = parsed
+                        if (selectedPlaylistId == null || parsed.none { it.id == selectedPlaylistId }) {
+                            val nextId = (parsed.firstOrNull { it.tracks.size >= 2 } ?: parsed.firstOrNull())?.id
+                            selectedPlaylistId = nextId
+                            cache.selectedPlaylistId = nextId
+                        }
+                        playlistNote = ""
+                    }.onFailure { err ->
+                        if (err is CancellationException) throw err
+                        playlistNote = err.message ?: "读取歌单失败"
+                    }
+                }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 message = "读取曲库失败，请检查曲库读取权限"
@@ -1556,12 +2048,15 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        LaunchedEffect(plugin, host) { refreshLists(selectInitialPair = true) }
+        LaunchedEffect(plugin, host) { refreshLists(selectInitialPair = true, deferCommit = true) }
 
         LaunchedEffect(host, library) {
             val bridge = host ?: return@LaunchedEffect
             bridge.queueStates().collect { state ->
-                queue = bridge.queueView(state, library)
+                val next = withContext(Dispatchers.Default) { bridge.queueView(state, library) }
+                awaitMotionSettled()
+                queue = next
+                cache.queue = next
             }
         }
 
@@ -1583,22 +2078,24 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
         val metadataPathsByKey = remember(playlistTab, queueEntries, activePlaylist) {
             when (playlistTab) {
                 "queue" -> queueEntries.associate { playlistRowKey(it.queueId.toString()) to it.item.path }
-                "playlists" -> activePlaylist?.tracks.orEmpty().associate { playlistRowKey(it.syncTrackId) to it.item.path }
+                "playlists" -> activePlaylist?.tracks.orEmpty().associate { playlistRowKey(it.rowKey) to it.item.path }
                 else -> emptyMap()
             }
         }
         val metadataRequest by rememberUpdatedState(Triple(metadataRevision, playlistScroll, metadataPathsByKey))
         val selectedMetadataPaths by rememberUpdatedState(listOfNotNull(a?.path, b?.path))
         LaunchedEffect(plugin) {
-            snapshotFlow {
+            snapshotFlow<Pair<Int, Set<String>>?> {
+                if (!canCommitState) return@snapshotFlow null
                 val (revision, scroll, pathsByKey) = metadataRequest
-                revision to buildSet {
+                revision to buildSet<String> {
                     addAll(selectedMetadataPaths)
                     scroll.layoutInfo.visibleItemsInfo.forEach { item ->
                         (item.key as? String)?.let(pathsByKey::get)?.let(::add)
                     }
                 }
-            }.collect { (_, paths) ->
+            }.collect { request ->
+                val (_, paths) = request ?: return@collect
                 for (batch in paths.chunked(30)) {
                     val before = batch.associateWith { trackMetadata[it] }
                     val cached = try {
@@ -1608,13 +2105,22 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                     } catch (_: Exception) {
                         break
                     }
+                    awaitMotionSettled()
+                    val toPut = mutableMapOf<String, TrackAnalysisMetadata>()
+                    val toRemove = mutableListOf<String>()
                     for (path in batch) {
                         // A pair can finish analysis while the cache lookup is in progress.
                         if (trackMetadata[path] === before[path]) {
                             val value = cached[path]
-                            if (value == null) trackMetadata.remove(path) else trackMetadata[path] = value
+                            if (value == null) {
+                                if (path in trackMetadata) toRemove += path
+                            } else if (trackMetadata[path] != value) {
+                                toPut[path] = value
+                            }
                         }
                     }
+                    if (toPut.isNotEmpty()) trackMetadata.putAll(toPut)
+                    for (path in toRemove) trackMetadata.remove(path)
                 }
             }
         }
@@ -1648,13 +2154,23 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        fun handleMovePlaylist(playlistId: String, fromIdx: Int, toIdx: Int): Boolean {
-            if (plugin.bridge?.canReorderPlaylists != true) return false
-            val pl = playlists.firstOrNull { it.id == playlistId } ?: return false
-            if (scanJob != null || pl.tracks.size != pl.members.size ||
-                fromIdx !in pl.tracks.indices || toIdx !in pl.tracks.indices || fromIdx == toIdx) return false
-            val nextTracks = pl.tracks.toMutableList().apply { add(toIdx, removeAt(fromIdx)) }
+        fun handleMovePlaylist(playlistId: String, fromIdx: Int, toIdx: Int, onRejected: () -> Unit = {}) {
+            if (movingPlaylist || plugin.bridge?.canReorderPlaylists != true) {
+                onRejected()
+                return
+            }
+            val pl = playlists.firstOrNull { it.id == playlistId }
+            if (pl == null || scanJob != null || pl.tracks.size != pl.members.size ||
+                fromIdx !in pl.tracks.indices || toIdx !in pl.tracks.indices || fromIdx == toIdx) {
+                onRejected()
+                return
+            }
+            val nextTracks = pl.tracks.toMutableList()
+                .apply { add(toIdx, removeAt(fromIdx)) }
+                .mapIndexed { idx, track -> track.copy(memberIndex = idx) }
             val switchedSort = pl.trackSort != 0 || pl.descending
+            movingPlaylist = true
+            playlistNote = "正在同步歌单顺序…"
             playlists = playlists.map {
                 if (it.id == playlistId) it.copy(
                     tracks = nextTracks,
@@ -1664,29 +2180,32 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                 ) else it
             }
             scope.launch {
-                val result = withContext(Dispatchers.IO) {
-                    plugin.bridge?.reorderPlaylist(playlistId, nextTracks.map { it.syncTrackId })
-                        ?: Result.failure(IllegalStateException("宿主桥接未就绪"))
-                }
-                result.onSuccess {
-                    playlistNote = if (switchedSort) {
-                        "已同步 SPW 歌单顺序（已切换为自定义正序）"
-                    } else {
-                        "已同步 SPW 歌单顺序"
+                try {
+                    val result = withContext(Dispatchers.IO) {
+                        plugin.bridge?.reorderPlaylist(playlistId, nextTracks.map { it.syncTrackId })
+                            ?: Result.failure(IllegalStateException("宿主桥接未就绪"))
                     }
-                }.onFailure { err ->
-                    playlistNote = "歌单排序写回失败：${err.message ?: err.javaClass.simpleName}"
-                    loadSpwPlaylists(library)
+                    result.onSuccess {
+                        playlistNote = if (switchedSort) {
+                            "已同步 SPW 歌单顺序（已切换为自定义正序）"
+                        } else {
+                            "已同步 SPW 歌单顺序"
+                        }
+                    }.onFailure { err ->
+                        playlistNote = "歌单排序写回失败：${err.message ?: err.javaClass.simpleName}"
+                        loadSpwPlaylists(library)
+                    }
+                } finally {
+                    movingPlaylist = false
                 }
             }
-            return true
         }
 
         fun runPlaylistAction(source: SpwPlaylist, mode: PlaylistScanMode) {
             val bridge = plugin.bridge
             val nameSuffix = mode.suffix
-            if (scanJob != null || source.members.isEmpty()) return
-            if (nameSuffix != null && (source.members.size < 2 || bridge?.canCreatePlaylists != true)) return
+            if (scanJob != null || source.tracks.size < 2) return
+            if (nameSuffix != null && bridge?.canCreatePlaylists != true) return
             val total = source.members.size
             val paths = source.members.map { it.path }
             scanNote = ""
@@ -1728,6 +2247,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                     loadSpwPlaylists(library)
                     if (playlists.any { it.id == id }) {
                         selectedPlaylistId = id
+                        cache.selectedPlaylistId = id
                     }
                     val details = buildList {
                         add("已创建「$title」 · ${indices.size}/$total 首")
@@ -1762,6 +2282,48 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
+        fun resolveHighlightedPair(
+            tracks: List<MediaItem>,
+            rowKeys: List<String>,
+            currentTrackIndex: Int,
+            isAdjacent: (Int) -> Boolean,
+            wrapAround: Boolean
+        ): Pair<Int, Int> {
+            val itemA = a
+            val itemB = b
+            if (itemA == null && itemB == null) return -1 to -1
+            if (itemA != null && itemB != null) {
+                selectedPairKeys?.let { (keyA, keyB) ->
+                    val idxA = rowKeys.indexOf(keyA)
+                    val idxB = rowKeys.indexOf(keyB)
+                    if (idxA in tracks.indices && idxB in tracks.indices &&
+                        tracks[idxA].id == itemA.id && tracks[idxB].id == itemB.id) {
+                        return idxA to idxB
+                    }
+                }
+                if (currentTrackIndex in tracks.indices && tracks[currentTrackIndex].id == itemA.id) {
+                    val nextIdx = currentTrackIndex + 1
+                    if (nextIdx < tracks.size && isAdjacent(currentTrackIndex) && tracks[nextIdx].id == itemB.id) {
+                        return currentTrackIndex to nextIdx
+                    }
+                    if (wrapAround && currentTrackIndex == tracks.lastIndex && tracks.size > 1 && tracks.first().id == itemB.id) {
+                        return currentTrackIndex to 0
+                    }
+                }
+                for (i in 0 until tracks.lastIndex) {
+                    if (isAdjacent(i) && tracks[i].id == itemA.id && tracks[i + 1].id == itemB.id) {
+                        return i to (i + 1)
+                    }
+                }
+                if (wrapAround && tracks.size > 1 && tracks.last().id == itemA.id && tracks.first().id == itemB.id) {
+                    return tracks.lastIndex to 0
+                }
+            }
+            val idxA = itemA?.let { target -> tracks.indexOfFirst { it.id == target.id } } ?: -1
+            val idxB = itemB?.let { target -> tracks.indexOfFirst { it.id == target.id && it.id != itemA?.id } } ?: -1
+            return idxA to idxB
+        }
+
         @OptIn(ExperimentalFoundationApi::class)
         fun LazyListScope.mixTrackItems(
             tracks: List<MediaItem>,
@@ -1772,9 +2334,13 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             canReorder: Boolean,
             moveEnabled: Boolean = true,
             isAdjacent: (Int) -> Boolean = { true },
+            wrapAround: Boolean = false,
             onPlay: ((Int) -> Unit)? = null,
             onMove: (fromIdx: Int, toIdx: Int) -> Unit
         ) {
+            val (highlightIdxA, highlightIdxB) = resolveHighlightedPair(
+                tracks, rowKeys, currentTrackIndex, isAdjacent, wrapAround
+            )
             items(tracks.size, key = { playlistRowKey(rowKeys[it]) }) { idx ->
                 val track = tracks[idx]
                 val rowKey = rowKeys[idx]
@@ -1785,8 +2351,8 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                 val dragPosition = drag.displayPosition(rowKeys)
                 val dragOrigin = dragPosition?.origin?.index ?: -1
                 val dragTargetIdx = dragPosition?.target(stridePx, tracks.size) ?: -1
-                val isA = a?.id == track.id
-                val isB = b?.id == track.id
+                val isA = idx == highlightIdxA
+                val isB = idx == highlightIdxB
                 val isDragging = dragPosition?.origin?.key == rowKey
                 val animY = remember { Animatable(0f) }
                 var prevIdx by remember { mutableStateOf(idx) }
@@ -1825,18 +2391,22 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                     }
                 }
 
-                val rowShape = RoundedCornerShape(8.dp)
+                val rowShape = RoundedCornerShape(10.dp)
+                var rowHovered by remember(rowKey) { mutableStateOf(false) }
                 val rowBg = when {
-                    isA -> palette.curveVol.copy(alpha = if (skin.isDark) 0.14f else 0.08f)
-                    isB -> palette.curveFilter.copy(alpha = if (skin.isDark) 0.14f else 0.08f)
-                    else -> skin.background
+                    isA -> palette.curveVol.copy(alpha = if (skin.isDark) 0.16f else 0.08f).compositeOver(skin.surface)
+                    isB -> palette.curveFilter.copy(alpha = if (skin.isDark) 0.16f else 0.08f).compositeOver(skin.surface)
+                    rowHovered -> if (skin.pageBackground.alpha < 1f) skin.hover
+                        else skin.hover.copy(alpha = 0.45f).compositeOver(skin.surface)
+                    else -> skin.surface
                 }
                 val rowBorder = when {
-                    isA -> palette.curveVol.copy(alpha = 0.45f)
-                    isB -> palette.curveFilter.copy(alpha = 0.45f)
+                    isA -> palette.curveVol.copy(alpha = 0.48f)
+                    isB -> palette.curveFilter.copy(alpha = 0.48f)
                     else -> skin.line
                 }
                 val hasNext = idx + 1 < tracks.size && isAdjacent(idx) && track.id != tracks[idx + 1].id
+                val hasWrap = wrapAround && idx == tracks.lastIndex && tracks.size > 1 && track.id != tracks.first().id
                 val hasPrevious = idx > 0 && isAdjacent(idx - 1) && track.id != tracks[idx - 1].id
                 Column {
                     Row(
@@ -1848,14 +2418,17 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                 alpha = if (isDragging) 0f else 1f
                             }
                             .clip(rowShape)
+                            .onPointerEvent(PointerEventType.Enter) { rowHovered = true }
+                            .onPointerEvent(PointerEventType.Exit) { rowHovered = false }
                             .background(rowBg)
-                            .border(0.5.dp, rowBorder, rowShape)
+                            .border(1.dp, rowBorder, rowShape)
                             .combinedClickable(
-                                enabled = (hasNext || hasPrevious || onPlay != null) && dragPosition == null,
+                                enabled = (hasNext || hasWrap || hasPrevious || onPlay != null) && dragPosition == null,
                                 onDoubleClick = onPlay?.let { play -> { play(idx) } },
                                 onClick = {
-                                    if (hasNext) selectPair(track to tracks[idx + 1])
-                                    else if (hasPrevious) selectPair(tracks[idx - 1] to track)
+                                    if (hasNext) selectPair(track to tracks[idx + 1], rowKey to rowKeys[idx + 1])
+                                    else if (hasWrap) selectPair(track to tracks.first(), rowKey to rowKeys.first())
+                                    else if (hasPrevious) selectPair(tracks[idx - 1] to track, rowKeys[idx - 1] to rowKey)
                                 }
                             )
                             .padding(horizontal = playlistRowPadding, vertical = 6.dp),
@@ -1877,7 +2450,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                     contentAlignment = Alignment.Center
                                 ) {
                                     Canvas(Modifier.size(8.dp, 13.dp)) {
-                                        val dotCol = skin.muted.copy(alpha = 0.65f)
+                                        val dotCol = skin.muted.copy(alpha = if (rowHovered || isA || isB) 0.78f else 0.34f)
                                         val r = 1.2.dp.toPx()
                                         val xs = floatArrayOf(size.width * 0.25f, size.width * 0.75f)
                                         val ys = floatArrayOf(size.height * 0.20f, size.height * 0.50f, size.height * 0.80f)
@@ -1955,15 +2528,22 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             PlaylistTrackDetails(track.duration, trackMetadata[track.path])
                         }
                         if (canReorder) {
-                            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                val upEnabled = moveEnabled && dragPosition == null && idx > 0
-                                val downEnabled = moveEnabled && dragPosition == null && idx + 1 < tracks.size
+                            val showArrows = rowHovered || isA || isB
+                            Column(
+                                Modifier.graphicsLayer { alpha = if (showArrows) 1f else 0f },
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                val upEnabled = showArrows && moveEnabled && dragPosition == null && idx > 0
+                                val downEnabled = showArrows && moveEnabled && dragPosition == null && idx + 1 < tracks.size
+                                var upHovered by remember(rowKey) { mutableStateOf(false) }
+                                var downHovered by remember(rowKey) { mutableStateOf(false) }
                                 Box(
                                     Modifier
                                         .size(20.dp)
                                         .clip(RoundedCornerShape(5.dp))
-                                        .background(skin.surface)
-                                        .border(0.5.dp, skin.line, RoundedCornerShape(5.dp))
+                                        .onPointerEvent(PointerEventType.Enter) { upHovered = true }
+                                        .onPointerEvent(PointerEventType.Exit) { upHovered = false }
+                                        .background(if (upHovered && upEnabled) skin.background else Color.Transparent)
                                         .clickable(enabled = upEnabled) { onMove(idx, idx - 1) }
                                         .semantics { contentDescription = "上移歌曲" },
                                     contentAlignment = Alignment.Center
@@ -1979,8 +2559,9 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                     Modifier
                                         .size(20.dp)
                                         .clip(RoundedCornerShape(5.dp))
-                                        .background(skin.surface)
-                                        .border(0.5.dp, skin.line, RoundedCornerShape(5.dp))
+                                        .onPointerEvent(PointerEventType.Enter) { downHovered = true }
+                                        .onPointerEvent(PointerEventType.Exit) { downHovered = false }
+                                        .background(if (downHovered && downEnabled) skin.background else Color.Transparent)
                                         .clickable(enabled = downEnabled) { onMove(idx, idx + 1) }
                                         .semantics { contentDescription = "下移歌曲" },
                                     contentAlignment = Alignment.Center
@@ -1996,68 +2577,84 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                         }
                     }
 
-                    if (hasNext) {
+                    if (hasNext || hasWrap) {
+                        val nextIdx = if (hasNext) idx + 1 else 0
                         val t1 = track
-                        val t2 = tracks[idx + 1]
+                        val t2 = tracks[nextIdx]
                         val transitionKey = pairKey(t1.id, t2.id)
                         val savedPlan = savedPlans[transitionKey]
                         val unsaved = plugin.drafts[transitionKey]?.let { it != savedPlan } == true
-                        val isEditing = a?.id == t1.id && b?.id == t2.id
-                        val pillShape = RoundedCornerShape(999.dp)
+                        val isEditing = idx == highlightIdxA && nextIdx == highlightIdxB
+                        val emphasized = isEditing || savedPlan != null || unsaved
+                        val prefix = if (hasWrap) "循环过渡" else "过渡"
+                        val pillShape = RoundedCornerShape(7.dp)
+                        var connHovered by remember(transitionKey, idx) { mutableStateOf(false) }
                         val pillBg = when {
-                            isEditing -> skin.accent
-                            savedPlan != null -> skin.accent.copy(alpha = if (skin.isDark) 0.20f else 0.10f)
-                            else -> skin.background
+                            isEditing -> skin.accent.copy(alpha = if (skin.isDark) 0.26f else 0.14f)
+                            savedPlan != null || unsaved -> skin.accent.copy(alpha = if (skin.isDark) 0.16f else 0.09f)
+                            connHovered -> skin.surface
+                            else -> Color.Transparent
                         }
                         val pillBorder = when {
-                            isEditing -> skin.accent
-                            savedPlan != null -> skin.accent.copy(alpha = 0.50f)
-                            else -> skin.line
+                            isEditing -> skin.accent.copy(alpha = 0.55f)
+                            savedPlan != null || unsaved -> skin.accent.copy(alpha = 0.35f)
+                            connHovered -> skin.line
+                            else -> Color.Transparent
                         }
                         val pillTextCol = when {
-                            isEditing -> skin.onAccent
-                            savedPlan != null -> skin.accent
+                            isEditing || savedPlan != null || unsaved -> skin.accent
+                            connHovered -> skin.text
                             else -> skin.muted
                         }
                         val pillText = when {
-                            unsaved -> "过渡 · 有未保存的修改"
-                            isEditing && savedPlan != null -> "正在编辑 · ${planSummary(savedPlan)} · 已保存"
+                            unsaved -> "$prefix · 未保存修改"
+                            isEditing && savedPlan != null -> "正在编辑 · ${planSummary(savedPlan)}"
                             isEditing -> "正在编辑 · 自动规划"
-                            savedPlan != null -> "过渡 · ${planSummary(savedPlan)} · 已保存"
-                            else -> "过渡 · 自动规划"
+                            savedPlan != null -> "${planSummary(savedPlan)} · 已保存"
+                            hasWrap -> "循环过渡 · 自动规划"
+                            else -> "自动规划"
                         }
                         val connAlpha by animateFloatAsState(
                             targetValue = if (dragPosition != null) 0.18f else 1f
                         )
+                        val stemCol = when {
+                            emphasized -> skin.accent.copy(alpha = 0.72f)
+                            connHovered -> skin.muted.copy(alpha = 0.65f)
+                            else -> skin.muted.copy(alpha = 0.28f)
+                        }
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .height(playlistTransitionHeight)
                                 .graphicsLayer { alpha = connAlpha }
-                                .padding(horizontal = 8.dp),
+                                .padding(horizontal = playlistRowPadding),
                             horizontalArrangement = Arrangement.spacedBy(6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             if (canReorder) {
-                                Spacer(Modifier.width(16.dp))
+                                Spacer(Modifier.width(playlistHandleWidth))
                             }
                             Spacer(Modifier.width(26.dp))
                             Box(Modifier.width(playlistCoverSize).fillMaxHeight(), contentAlignment = Alignment.Center) {
+                                Box(Modifier.width(1.5.dp).fillMaxHeight().background(stemCol))
                                 Box(
                                     Modifier
-                                        .width(1.5.dp)
-                                        .fillMaxHeight()
-                                        .background(if (isEditing || savedPlan != null) skin.accent else skin.line)
+                                        .size(if (emphasized) 6.dp else 5.dp)
+                                        .clip(CircleShape)
+                                        .background(if (emphasized) skin.accent else if (connHovered) skin.muted else skin.line)
+                                        .border(1.dp, skin.pageBackground, CircleShape)
                                 )
                             }
                             Row(
                                 Modifier
                                     .clip(pillShape)
+                                    .onPointerEvent(PointerEventType.Enter) { connHovered = true }
+                                    .onPointerEvent(PointerEventType.Exit) { connHovered = false }
                                     .background(pillBg)
-                                    .border(0.5.dp, pillBorder, pillShape)
-                                    .clickable { a = t1; b = t2 }
-                                    .padding(horizontal = 9.dp, vertical = 3.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    .then(if (pillBorder != Color.Transparent) Modifier.border(0.8.dp, pillBorder, pillShape) else Modifier)
+                                    .clickable { selectPair(t1 to t2, rowKey to rowKeys[nextIdx]) }
+                                    .padding(horizontal = 8.dp, vertical = 2.dp),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 BasicText(
@@ -2066,12 +2663,12 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                     style = skin.sub.copy(
                                         color = pillTextCol,
                                         fontSize = 11.sp,
-                                        fontWeight = if (isEditing || savedPlan != null) FontWeight.Medium else FontWeight.Normal
+                                        fontWeight = if (emphasized) FontWeight.Medium else FontWeight.Normal
                                     ),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
-                                Canvas(Modifier.size(6.dp, 8.dp)) {
+                                Canvas(Modifier.size(5.dp, 7.dp)) {
                                     val middle = Offset(size.width * 0.80f, size.height * 0.50f)
                                     val stroke = 1.dp.toPx()
                                     drawLine(pillTextCol, Offset(size.width * 0.25f, size.height * 0.10f), middle, stroke, StrokeCap.Round)
@@ -2087,100 +2684,39 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
         }
 
         @Composable
-        fun PlaylistRowItem(
-            idxTag: String,
-            itemA: MediaItem,
-            itemB: MediaItem,
-            selected: Boolean,
-            plan: Plan?,
-            onSelect: () -> Unit
-        ) {
-            val rowShape = RoundedCornerShape(8.dp)
-            val bg = if (selected) skin.accent.copy(alpha = if (skin.isDark) 0.22f else 0.10f) else skin.background
-            val border = if (selected) skin.accent.copy(alpha = 0.55f) else skin.line
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(rowShape)
-                    .background(bg)
-                    .border(0.5.dp, border, rowShape)
-                    .clickable(onClick = onSelect)
-                    .padding(horizontal = 10.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(if (selected) skin.accent else skin.surface)
-                            .border(0.5.dp, if (selected) skin.accent else skin.line, RoundedCornerShape(4.dp))
-                            .padding(horizontal = 6.dp, vertical = 1.dp)
-                    ) {
-                        BasicText(
-                            idxTag,
-                            style = skin.sub.copy(
-                                color = if (selected) skin.onAccent else skin.muted,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Medium
-                            )
-                        )
-                    }
-                    if (plan != null) {
-                        Box(
-                            Modifier
-                                .clip(RoundedCornerShape(4.dp))
-                                .background(skin.surface)
-                                .border(0.5.dp, skin.line, RoundedCornerShape(4.dp))
-                                .padding(horizontal = 6.dp, vertical = 1.dp)
-                        ) {
-                            BasicText(planSummary(plan), style = skin.sub.copy(color = skin.muted, fontSize = 10.sp))
-                        }
-                    }
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically) {
-                    PlaylistCover(itemA.id, covers, 22.dp)
-                    BasicText(
-                        itemA.title,
-                        style = skin.sub.copy(color = if (selected) skin.accent else skin.text, fontWeight = FontWeight.Medium),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(7.dp), verticalAlignment = Alignment.CenterVertically) {
-                    PlaylistCover(itemB.id, covers, 22.dp)
-                    BasicText(
-                        "→ ${itemB.title}",
-                        style = skin.sub.copy(color = skin.muted),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
-
-        @Composable
         fun PlaylistPanel(modifier: Modifier = Modifier) {
             val curQueueIdx = queueEntries.indexOfFirst { it.rawIndex == queue.currentIndex }
+            LaunchedEffect(playlistTab, curQueueIdx, pageEntering) {
+                if (playlistTab == "queue" && curQueueIdx >= 0 && !pageEntering && !cache.queueScrolledToCurrent) {
+                    cache.queueScrolledToCurrent = true
+                    // Item 0 is queue-header; scrolling to curQueueIdx keeps the current track near the top with context.
+                    queueScroll.scrollToItem(curQueueIdx)
+                }
+            }
+            val hasQueueWrap = queueEntries.size > 1 &&
+                queueEntries.first().rawIndex == 0 &&
+                queueEntries.last().rawIndex == queue.order.lastIndex &&
+                queueEntries.last().item.id != queueEntries.first().item.id &&
+                queue.currentIndex == queue.order.lastIndex &&
+                queue.nextPair?.let { it.first.id == queueEntries.last().item.id && it.second.id == queueEntries.first().item.id } == true
             val cardSummary = when (playlistTab) {
                 "queue" -> {
                     val posText = if (queue.currentIndex in queue.order.indices) {
                         "当前 ${queue.currentIndex + 1}/${queue.order.size}"
                     } else "${queue.order.size} 首队列"
-                    val savedCount = queueTracks.zipWithNext().withIndex().count { (idx, pair) ->
+                    val adjacentSaved = queueTracks.zipWithNext().withIndex().count { (idx, pair) ->
                         queueEntries[idx].rawIndex + 1 == queueEntries[idx + 1].rawIndex &&
                             pairKey(pair.first.id, pair.second.id) in savedPlans
                     }
+                    val wrapSaved = if (hasQueueWrap && pairKey(queueTracks.last().id, queueTracks.first().id) in savedPlans) 1 else 0
+                    val savedCount = adjacentSaved + wrapSaved
                     if (savedCount == 0) posText else "$posText · 已自定义 $savedCount 处"
                 }
                 "saved" -> "${savedPairs.size} 组已保存过渡"
                 else -> null
             }
 
-            Column(modifier.background(skin.surface)) {
+            Column(modifier) {
                 Column(
                     Modifier
                         .fillMaxWidth()
@@ -2199,14 +2735,21 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            Chip("当前转场", compact = true, enabled = curQueueIdx >= 0 || queue.nextPair != null) {
-                                playlistTab = "queue"
-                                queue.nextPair?.let(::selectPair)
-                                // The queue status above the tracks occupies the first list item.
-                                if (curQueueIdx >= 0) queueScroll.requestScrollToItem(curQueueIdx + 1)
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Chip("当前转场", compact = true, quiet = true, enabled = curQueueIdx >= 0 || queue.nextPair != null) {
+                                selectTab("queue")
+                                val nextPair = queue.nextPair
+                                if (nextPair != null) {
+                                    selectPair(nextPair)
+                                    queueNote = ""
+                                    // The queue status above the tracks occupies the first list item.
+                                    if (curQueueIdx >= 0) queueScroll.requestScrollToItem(curQueueIdx + 1)
+                                } else {
+                                    queueNote = queue.nextPairNote
+                                    queueScroll.requestScrollToItem(0)
+                                }
                             }
-                            Chip("↻", compact = true, description = "刷新", enabled = !refreshing && !movingQueue && scanJob == null) {
+                            MaterialSymbolButton(MaterialSymbol.Refresh, enabled = !refreshing && !movingQueue && !movingPlaylist && scanJob == null) {
                                 refreshing = true
                                 queueNote = ""
                                 scope.launch {
@@ -2216,20 +2759,11 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             }
                         }
                     }
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                        Chip("队列", selected = playlistTab == "queue", compact = true) {
-                            playlistTab = "queue"
-                        }
-                        Chip("歌单", selected = playlistTab == "playlists", compact = true) {
-                            playlistTab = "playlists"
-                        }
-                        Chip("已保存", selected = playlistTab == "saved", compact = true) {
-                            playlistTab = "saved"
-                        }
-                        Chip("自选", selected = playlistTab == "custom", compact = true) {
-                            playlistTab = "custom"
-                        }
-                    }
+                    SegmentedTabs(
+                        options = listOf("queue" to "队列", "playlists" to "歌单", "saved" to "已保存", "custom" to "自选"),
+                        selected = playlistTab,
+                        onSelect = ::selectTab
+                    )
                     cardSummary?.let { Label(it, small = true) }
                     if (playlistTab == "playlists") {
                         val pl = activePlaylist
@@ -2238,14 +2772,16 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             PlaylistToolbar(
                                 playlists = playlists,
                                 current = pl,
-                                canPick = scanJob == null,
-                                canScan = !refreshing && scanJob == null && pl?.members?.isNotEmpty() == true,
-                                canGenerate = canCreate && (pl?.members?.size ?: 0) >= 2,
+                                canPick = scanJob == null && !movingPlaylist,
+                                canScan = !refreshing && !movingPlaylist && scanJob == null && (pl?.tracks?.size ?: 0) >= 2,
+                                canGenerate = canCreate && (pl?.tracks?.size ?: 0) >= 2,
                                 activity = if (writingPlaylist) "创建中…" else scanProgress?.let { (done, total) -> "扫描 $done/$total" },
                                 onCancel = if (scanJob != null && !writingPlaylist) ({ scanJob?.cancel() }) else null,
                                 onPick = {
                                     selectedPlaylistId = it.id
+                                    cache.selectedPlaylistId = it.id
                                     scanNote = ""
+                                    playlistNote = ""
                                 },
                                 onAction = { mode -> pl?.let { runPlaylistAction(it, mode) } }
                             )
@@ -2254,8 +2790,9 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             scanNote.isNotBlank() -> scanNote
                             playlistNote.isNotBlank() -> playlistNote
                             playlists.isEmpty() -> "未读取到 SPW 歌单，可点击刷新"
-                            pl != null && pl.members.size >= 2 && !canCreate -> "当前 SPW 版本的自动新建歌单接口不可用"
                             pl != null && pl.tracks.size < 2 -> "编辑转场需要至少两首本地歌曲"
+                            pl != null && pl.members.size >= 2 && !canCreate -> "当前 SPW 版本的自动新建歌单接口不可用"
+                            pl != null && pl.tracks.size != pl.members.size -> "含未匹配本地曲目，暂不支持调序"
                             else -> null
                         }
                         note?.let { Label(it, small = true) }
@@ -2266,17 +2803,17 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
 
                 val rowDrag = remember(playlistScroll) { PlaylistRowDrag() }
                 val queueKeys = remember(queueEntries) { queueEntries.map { it.queueId.toString() } }
-                val playlistKeys = remember(activePlaylist) { activePlaylist?.tracks?.map { it.syncTrackId }.orEmpty() }
+                val playlistKeys = remember(activePlaylist) { activePlaylist?.tracks?.map { it.rowKey }.orEmpty() }
                 val canMoveQueue = !movingQueue && !refreshing
                 val canReorderPlaylist = activePlaylist?.let {
                     host?.canReorderPlaylists == true && it.tracks.size == it.members.size
                 } == true
-                val canMovePlaylist = scanJob == null
+                val canMovePlaylist = !movingPlaylist && !refreshing && scanJob == null
                 val reorder = when {
                     playlistTab == "queue" && canMoveQueue -> PlaylistReorder(queueTracks, queueKeys, ::handleMoveQueue)
                     playlistTab == "playlists" && activePlaylist != null && canReorderPlaylist && canMovePlaylist ->
                         PlaylistReorder(activePlaylistItems, playlistKeys) { from, to, onRejected ->
-                            if (!handleMovePlaylist(activePlaylist.id, from, to)) onRejected()
+                            handleMovePlaylist(activePlaylist.id, from, to, onRejected)
                         }
                     else -> null
                 }
@@ -2291,7 +2828,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             item("queue-header") {
                                 Column(Modifier.padding(bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Label(queue.nextPairNote, small = true)
-                                    if (queueNote.isNotBlank()) Label(queueNote, small = true)
+                                    if (queueNote.isNotBlank() && queueNote != queue.nextPairNote) Label(queueNote, small = true)
                                     if (queueTracks.isEmpty() && queue.order.isNotEmpty()) {
                                         Label("队列里的歌曲未匹配到本地曲库", small = true)
                                     }
@@ -2306,6 +2843,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                 canReorder = true,
                                 moveEnabled = canMoveQueue,
                                 isAdjacent = { i -> queueEntries[i].rawIndex + 1 == queueEntries[i + 1].rawIndex },
+                                wrapAround = hasQueueWrap,
                                 onPlay = if (host?.canPlayTracks == true) { index ->
                                     playFromList { it.playQueueTrack(queueEntries[index]) }
                                 } else null,
@@ -2319,8 +2857,10 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                     tracks = activePlaylistItems,
                                     rowKeys = playlistKeys,
                                     drag = rowDrag,
+                                    rowNumbers = pl.tracks.map { it.memberIndex + 1 },
                                     canReorder = canReorderPlaylist,
                                     moveEnabled = canMovePlaylist,
+                                    isAdjacent = { i -> pl.tracks[i].memberIndex + 1 == pl.tracks[i + 1].memberIndex },
                                     onPlay = if (host?.canPlayTracks == true) { index ->
                                         playFromList { it.playPlaylistTrack(activePlaylistItems, index) }
                                     } else null,
@@ -2339,7 +2879,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                     val (sA, sB) = savedPairs[idx]
                                     val isSel = a?.id == sA.id && b?.id == sB.id
                                     Box(Modifier.padding(bottom = 6.dp)) {
-                                        PlaylistRowItem("#${idx + 1}", sA, sB, isSel, savedPlans[pairKey(sA.id, sB.id)]) {
+                                        SavedTransitionRow(sA, sB, savedPlans[pairKey(sA.id, sB.id)], isSel, covers) {
                                             selectPair(sA to sB)
                                         }
                                     }
@@ -2353,8 +2893,18 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                         .border(0.5.dp, skin.line, RoundedCornerShape(8.dp)).padding(10.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    InlinePicker(library.filter { it.id != b?.id }, "A · 退出曲", a) { a = it }
-                                    InlinePicker(library.filter { it.id != a?.id }, "B · 进入曲", b) { b = it }
+                                    InlinePicker(library.filter { it.id != b?.id }, "A · 退出曲", a) {
+                                        a = it
+                                        selectedPairKeys = null
+                                        cache.selectedA = it
+                                        cache.selectedPairKeys = null
+                                    }
+                                    InlinePicker(library.filter { it.id != a?.id }, "B · 进入曲", b) {
+                                        b = it
+                                        selectedPairKeys = null
+                                        cache.selectedB = it
+                                        cache.selectedPairKeys = null
+                                    }
                                 }
                             } else {
                                 Label("请先等待曲库加载完成", small = true)
@@ -2365,51 +2915,53 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        BoxWithConstraints(Modifier.fillMaxSize()) {
-            val playlistModifier = Modifier.width((maxWidth * 0.32f).coerceIn(310.dp, 380.dp)).fillMaxHeight()
-            val aa = a
-            val bb = b
-            if (aa != null && bb != null) {
-                key(aa.id, bb.id) {
-                    PairWorkspace(
-                        plugin = plugin,
-                        a = aa,
-                        b = bb,
-                        tempoPair = trackMetadata[aa.path]?.let { from ->
-                            trackMetadata[bb.path]?.let(from::tempoPair)
-                        },
-                        savedPlan = savedPlans[pairKey(aa.id, bb.id)],
-                        onBack = onBack,
-                        onTrackAnalyzed = { path, metadata -> trackMetadata[path] = metadata },
-                        playlistPanel = { PlaylistPanel(playlistModifier) }
-                    )
-                }
-            } else {
-                val scroll = rememberScrollState()
-                Column(Modifier.fillMaxSize()) {
-                    EditorHeader(skin = skin, plugin = plugin, statusText = message, onBack = onBack)
-                    SaltDivider()
-                    Row(Modifier.weight(1f).fillMaxWidth()) {
-                        Box(
-                            Modifier.weight(1f).fillMaxHeight().verticalScroll(scroll),
-                            contentAlignment = Alignment.TopCenter
-                        ) {
-                            Column(
-                                Modifier
-                                    .widthIn(max = 1100.dp)
-                                    .fillMaxWidth()
-                                    .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 16.dp),
-                                verticalArrangement = Arrangement.spacedBy(10.dp)
+        PopupMenuBackdrop(Modifier.fillMaxSize(), enabled = !pageEntering && !pageClosing) {
+            BoxWithConstraints(Modifier.fillMaxSize()) {
+                val playlistModifier = Modifier.width((maxWidth * 0.31f).coerceIn(310.dp, 376.dp)).fillMaxHeight()
+                val aa = a
+                val bb = b
+                if (aa != null && bb != null) {
+                    key(aa.id, bb.id) {
+                        PairWorkspace(
+                            plugin = plugin,
+                            a = aa,
+                            b = bb,
+                            covers = covers,
+                            tempoPair = trackMetadata[aa.path]?.let { from ->
+                                trackMetadata[bb.path]?.let(from::tempoPair)
+                            },
+                            savedPlan = savedPlans[pairKey(aa.id, bb.id)],
+                            onBack = onBack,
+                            onTrackAnalyzed = { path, metadata -> trackMetadata[path] = metadata },
+                            playlistPanel = { PlaylistPanel(playlistModifier) }
+                        )
+                    }
+                } else {
+                    val scroll = rememberScrollState()
+                    Column(Modifier.fillMaxSize()) {
+                        EditorHeader(skin = skin, plugin = plugin, statusText = message, onBack = onBack)
+                        Row(Modifier.weight(1f).fillMaxWidth()) {
+                            Box(
+                                Modifier.weight(1f).fillMaxHeight().verticalScroll(scroll),
+                                contentAlignment = Alignment.TopCenter
                             ) {
-                                SaltCard { Label(message.ifBlank { "选择当前转场，或从右侧选择一组歌曲" }, small = true) }
+                                Column(
+                                    Modifier
+                                        .widthIn(max = 1100.dp)
+                                        .fillMaxWidth()
+                                        .padding(start = 20.dp, end = 10.dp, top = 8.dp, bottom = 20.dp),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    SaltCard { Label(message.ifBlank { "选择当前转场，或从右侧选择一组歌曲" }, small = true) }
+                                }
                             }
+                            PlaylistPanel(playlistModifier)
                         }
-                        Box(Modifier.width(0.5.dp).fillMaxHeight().background(skin.line))
-                        PlaylistPanel(playlistModifier)
                     }
                 }
             }
         }
+    }
     }
 }
 
@@ -2419,6 +2971,7 @@ private fun PairWorkspace(
     plugin: MainPlugin,
     a: MediaItem,
     b: MediaItem,
+    covers: PlaylistCoverStore,
     tempoPair: String?,
     savedPlan: Plan?,
     onBack: (() -> Unit)?,
@@ -2428,24 +2981,33 @@ private fun PairWorkspace(
     val scope = rememberCoroutineScope()
     val skin = LocalSkin.current
     val scroll = rememberScrollState()
+    val host by plugin.hosts.collectAsState()
+    val liveHighPass = host?.liveHighPass?.collectAsState()?.value == true
+    val pageEntering = LocalAutoMixPageEntering.current
+    val pageClosing = LocalAutoMixPageClosing.current
+    val canCommitState by rememberUpdatedState(!pageEntering && !pageClosing)
 
-    var analyzing by remember { mutableStateOf(true) }
+    val planKey = pairKey(a.id, b.id)
+    val history = remember(plugin.uiCache, planKey) {
+        plugin.uiCache.editHistories[planKey] ?: TransitionEditHistory()
+    }
+    val cachedPair = remember(plugin.uiCache, planKey) {
+        synchronized(plugin.uiCache.pairCache) { plugin.uiCache.pairCache[planKey] }
+    }
+    var analyzing by remember(planKey) { mutableStateOf(cachedPair == null) }
     var rendering by remember { mutableStateOf(false) }
-    var status by remember { mutableStateOf("正在分析双轨…") }
-    var waveA by remember { mutableStateOf<TrackWaves?>(null) }
-    var waveB by remember { mutableStateOf<TrackWaves?>(null) }
-    var autoPlan by remember { mutableStateOf<Plan?>(null) }
-    var reasons by remember { mutableStateOf(emptyList<String>()) }
+    var waveA by remember(planKey) { mutableStateOf(cachedPair?.waveA) }
+    var waveB by remember(planKey) { mutableStateOf(cachedPair?.waveB) }
+    var autoPlan by remember(planKey) { mutableStateOf(cachedPair?.autoPlan) }
+    var reasons by remember(planKey) { mutableStateOf(cachedPair?.reasons.orEmpty()) }
     var openParam by remember { mutableStateOf<TransitionParameter?>(null) }
     var hoveredPlan by remember { mutableStateOf<Plan?>(null) }
-    var editingCustom by remember { mutableStateOf(false) }
     var showReasons by remember { mutableStateOf(false) }
     var task by remember { mutableStateOf<Job?>(null) }
     var isPlaying by remember { mutableStateOf(false) }
     var playheadSec by remember { mutableStateOf<Double?>(null) }
     var writingPlan by remember { mutableStateOf(false) }
     val pendingPosition = remember { AtomicReference<Double?>(null) }
-    val planKey = pairKey(a.id, b.id)
     val draft = plugin.drafts[planKey]
     val p = draft ?: savedPlan ?: autoPlan
     fun effectiveLengthMs(item: MediaItem, wave: TrackWaves?): Long {
@@ -2466,17 +3028,29 @@ private fun PairWorkspace(
         savedPlan != null -> "已加载保存设置"
         else -> "已自动规划"
     })
+    var status by remember(planKey) {
+        mutableStateOf(if (cachedPair != null) idleStatus else "正在分析双轨…")
+    }
 
     fun setOpenParameter(parameter: TransitionParameter?) {
         hoveredPlan = null
         openParam = parameter
     }
 
-    DisposableEffect(plugin, a.id, b.id) {
-        onDispose { plugin.worker.stopPreview() }
+    fun currentEdit(): TransitionEdit {
+        val plan = plugin.drafts[planKey] ?: plugin.plans.value[planKey] ?: autoPlan
+        return TransitionEdit(plan, history.selection)
     }
 
-    LaunchedEffect(plugin, a.id, b.id) {
+    DisposableEffect(plugin, a.id, b.id) {
+        onDispose {
+            history.finishGesture(currentEdit())
+            plugin.worker.stopPreview()
+        }
+    }
+
+    LaunchedEffect(plugin, a.id, b.id, pageEntering, pageClosing) {
+        if (pageEntering || pageClosing) return@LaunchedEffect
         var wasPlaying = false
         while (true) {
             val running = plugin.worker.isPlaying()
@@ -2491,6 +3065,7 @@ private fun PairWorkspace(
     }
 
     LaunchedEffect(a.id, b.id) {
+        if (cachedPair != null) return@LaunchedEffect
         analyzing = true
         status = "正在自动分析双轨…"
         try {
@@ -2511,12 +3086,17 @@ private fun PairWorkspace(
             }
             val metadataA = data.a.metadata()
             val metadataB = data.b.metadata()
-            waveA = data.a.displayWave(metadataA)
-            waveB = data.b.displayWave(metadataB)
-            autoPlan = data.recommendation.plan
+            val nextWaveA = data.a.displayWave(metadataA)
+            val nextWaveB = data.b.displayWave(metadataB)
+            val snapshot = PairAnalysisSnapshot(nextWaveA, nextWaveB, data.recommendation.plan, data.recommendation.reasons)
+            synchronized(plugin.uiCache.pairCache) { plugin.uiCache.pairCache[planKey] = snapshot }
+            if (!canCommitState) snapshotFlow { canCommitState }.first { it }
+            waveA = nextWaveA
+            waveB = nextWaveB
+            autoPlan = snapshot.autoPlan
             onTrackAnalyzed(a.path, metadataA)
             onTrackAnalyzed(b.path, metadataB)
-            reasons = data.recommendation.reasons
+            reasons = snapshot.reasons
             status = idleStatus
         } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -2535,11 +3115,52 @@ private fun PairWorkspace(
         rendering = false
     }
 
-    fun adjust(next: Plan, note: String = "有未保存的修改") {
+    val isAutoMatch = autoPlan != null && p == autoPlan
+    val matchedPreset = p?.let { current -> Plan.presets.firstOrNull { it.matches(current) } }
+    val editingCustom = history.selection.custom
+    val preferPresetId = history.selection.presetId
+    val preferredPreset = preferPresetId?.let { id -> matchedPreset?.takeIf { it.id == id } }
+    val isAutoSelected = !editingCustom && isAutoMatch && preferredPreset == null
+    val activePresetId = when {
+        editingCustom || isAutoSelected -> null
+        preferredPreset != null -> preferredPreset.id
+        else -> matchedPreset?.id
+    }
+    val isCustom = editingCustom || (!isAutoSelected && activePresetId == null)
+
+    fun applyPlan(next: Plan?, note: String? = null) {
         stopAudition()
-        if (next == (savedPlan ?: autoPlan)) plugin.drafts.remove(planKey)
+        val committed = plugin.plans.value[planKey]
+        val clean = next == (committed ?: autoPlan)
+        if (clean || next == null) plugin.drafts.remove(planKey)
         else plugin.drafts[planKey] = next
-        status = note
+        status = when {
+            note != null -> note
+            next == null -> if (analyzing) "正在自动分析双轨…" else "暂无可用的转场方案"
+            clean -> if (committed != null) "已加载保存设置" else "已应用自动推荐"
+            else -> "有未保存的修改"
+        }
+    }
+
+    fun recordEdit(before: TransitionEdit, after: TransitionEdit) {
+        if (before != after) {
+            plugin.uiCache.editHistories[planKey] = history
+            history.record(before, after)
+        }
+    }
+
+    fun adjust(next: Plan, note: String? = null, selection: TransitionSelection? = null) {
+        val before = currentEdit()
+        val after = TransitionEdit(next, selection ?: before.selection.afterManualChange(before.plan, next))
+        recordEdit(before, after)
+        if (next != before.plan || note != null) applyPlan(next, note)
+    }
+
+    fun restoreEdit(redo: Boolean) {
+        val current = currentEdit()
+        val restored = (if (redo) history.redo(current) else history.undo(current)) ?: return
+        setOpenParameter(null)
+        applyPlan(restored.plan)
     }
 
     @Composable
@@ -2549,6 +3170,7 @@ private fun PairWorkspace(
         selected: T,
         options: Map<T, String>,
         modifier: Modifier,
+        selectedLabel: String = options[selected].orEmpty(),
         withValue: (T) -> Plan
     ) {
         ParameterMenu(
@@ -2556,9 +3178,10 @@ private fun PairWorkspace(
             color = color,
             selected = selected,
             options = options,
-            openParameter = openParam,
+            openParameter = if (LocalAutoMixPageClosing.current) null else openParam,
             onOpenChange = ::setOpenParameter,
             modifier = modifier,
+            selectedLabel = selectedLabel,
             onHover = { option ->
                 if (openParam == parameter) hoveredPlan = option?.let(withValue)
             },
@@ -2603,59 +3226,93 @@ private fun PairWorkspace(
         }
     }
 
-    val canSave = p != null && (p.useHost || window != null)
+    LaunchedEffect(pageClosing) {
+        if (pageClosing) {
+            history.finishGesture(currentEdit())
+            setOpenParameter(null)
+            val auditionWasActive = rendering || plugin.worker.isPlaying()
+            stopAudition()
+            if (auditionWasActive) status = idleStatus
+        }
+    }
+
+    val canSave = p != null && (p.useHost || p.noMix || window != null)
+    val saveAction: @Composable () -> Unit = {
+        if (p != null) {
+            val saveLabel = when {
+                writingPlan -> "写入中…"
+                savedPlan == p -> "已保存"
+                savedPlan != null -> "保存修改"
+                else -> "保存"
+            }
+            Chip(saveLabel, primary = true, compact = true, enabled = !analyzing && !writingPlan && canSave && savedPlan != p) {
+                writingPlan = true
+                scope.launch {
+                    try {
+                        withContext(Dispatchers.IO) { plugin.save(a.id, b.id, p) }
+                        if (plugin.drafts[planKey] == p) plugin.drafts.remove(planKey)
+                        status = if (planKey in plugin.drafts) "已保存 · 还有未保存的修改" else "已保存"
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        status = e.message ?: "保存失败"
+                    } finally {
+                        writingPlan = false
+                    }
+                }
+            }
+        }
+    }
+
+    val editActions: @Composable () -> Unit = {
+        val ready = !analyzing && !writingPlan && !pageClosing
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+            MaterialSymbolButton(MaterialSymbol.Undo, enabled = ready && history.canUndo) { restoreEdit(redo = false) }
+            MaterialSymbolButton(MaterialSymbol.Redo, enabled = ready && history.canRedo) { restoreEdit(redo = true) }
+            saveAction()
+        }
+    }
+
+    @Composable
+    fun WaveformPlaceholder(text: String) {
+        SaltCard {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(Modifier.weight(1f)) { Label(text, small = true) }
+                editActions()
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize()) {
-        // Pinned Header Bar with Save/Delete actions on the right.
         EditorHeader(
             skin = skin,
             plugin = plugin,
             statusText = status,
             onBack = onBack,
             actions = {
-                if (p != null) {
-                    val saveLabel = when {
-                        writingPlan -> "写入中…"
-                        savedPlan == p -> "已保存"
-                        savedPlan != null -> "保存修改"
-                        else -> "保存"
-                    }
-                    Chip(saveLabel, primary = true, enabled = !analyzing && !writingPlan && canSave && savedPlan != p) {
+                if (p != null && savedPlan != null) {
+                    Chip("删除", compact = true, quiet = true, enabled = !writingPlan) {
                         writingPlan = true
                         scope.launch {
                             try {
-                                withContext(Dispatchers.IO) { plugin.save(a.id, b.id, p) }
-                                if (plugin.drafts[planKey] == p) plugin.drafts.remove(planKey)
-                                status = if (planKey in plugin.drafts) "已保存 · 还有未保存的修改" else "已保存"
+                                val beforeDelete = currentEdit()
+                                withContext(Dispatchers.IO) { plugin.remove(a.id, b.id) }
+                                val remainingDraft = plugin.drafts[planKey]?.takeUnless { it == savedPlan }
+                                if (remainingDraft != null && remainingDraft != autoPlan) {
+                                    applyPlan(remainingDraft, "已删除保存方案 · 保留未保存的修改")
+                                } else {
+                                    val baseline = TransitionEdit(autoPlan, TransitionSelection())
+                                    recordEdit(beforeDelete, baseline)
+                                    applyPlan(baseline.plan, if (autoPlan == null) "已删除保存方案" else "已删除保存方案 · 恢复自动推荐")
+                                }
                             } catch (e: Exception) {
                                 if (e is CancellationException) throw e
-                                status = e.message ?: "保存失败"
+                                status = e.message ?: "删除失败"
                             } finally {
                                 writingPlan = false
-                            }
-                        }
-                    }
-                    if (savedPlan != null) {
-                        Chip("删除", compact = true, enabled = !writingPlan) {
-                            writingPlan = true
-                            scope.launch {
-                                try {
-                                    val draftBeforeDelete = plugin.drafts[planKey]
-                                    withContext(Dispatchers.IO) { plugin.remove(a.id, b.id) }
-                                    if (plugin.drafts[planKey] == draftBeforeDelete) {
-                                        stopAudition()
-                                        plugin.drafts.remove(planKey)
-                                        editingCustom = false
-                                        status = "已删除自定义，恢复自动推荐"
-                                    } else {
-                                        status = "已删除保存方案 · 保留新修改"
-                                    }
-                                } catch (e: Exception) {
-                                    if (e is CancellationException) throw e
-                                    status = e.message ?: "删除失败"
-                                } finally {
-                                    writingPlan = false
-                                }
                             }
                         }
                     }
@@ -2663,21 +3320,19 @@ private fun PairWorkspace(
             }
         )
 
-        SaltDivider()
-
         Row(Modifier.weight(1f).fillMaxWidth()) {
             BoxWithConstraints(
                 Modifier.weight(1f).fillMaxHeight(),
                 contentAlignment = Alignment.TopCenter
             ) {
-                val deckHeight = ((maxHeight - 390.dp) / 2).coerceIn(104.dp, 164.dp)
+                val deckHeight = ((maxHeight - 405.dp) / 2).coerceIn(104.dp, 164.dp)
                 Column(
                     Modifier
                         .widthIn(max = 1100.dp)
                         .fillMaxWidth()
                         .verticalScroll(scroll)
-                        .padding(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                        .padding(start = 20.dp, end = 10.dp, top = 8.dp, bottom = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                 val wA = waveA
                 val wB = waveB
@@ -2686,22 +3341,24 @@ private fun PairWorkspace(
 
                     // 1. Hero Panoramic Stage (Centered-box draggable minimap -> Track A -> Waveforms -> Track B).
                     if (p.useHost) {
-                        SaltCard { Label("此曲对由 SPW 按播放器设置切换，可在 SPW 播放时试听。") }
+                        WaveformPlaceholder("此曲对由 SPW 按播放器设置切换，可在 SPW 播放时试听。")
+                    } else if (p.noMix) {
+                        WaveformPlaceholder("无过渡效果。保存后，上一首播到曲尾，下一首从头开始。")
                     } else {
                         val shown = hoveredPlan ?: p
+                        val shownWindow = shown.window(lengthA, lengthB)
                         val showsAuditionTiming = shown.duration == p.duration && shown.cueA == p.cueA && shown.cueB == p.cueB
                         DeckStage(
-                            titleA = a.title,
-                            artistA = a.artist,
-                            titleB = b.title,
-                            artistB = b.artist,
+                            trackA = a,
+                            trackB = b,
+                            covers = covers,
                             waveA = wA,
                             waveB = wB,
                             deckHeight = deckHeight,
                             tempoPair = tempoPair,
                             plan = shown,
                             editPlan = p,
-                            audibleWindow = shown.window(lengthA, lengthB),
+                            audibleWindow = shownWindow,
                             lengthA = lengthA,
                             lengthB = lengthB,
                             canAudition = window != null,
@@ -2712,68 +3369,114 @@ private fun PairWorkspace(
                             isPlaying = isPlaying,
                             rendering = rendering,
                             onToggleAudition = { toggleAudition() },
-                            onUpdate = { adjust(it) },
+                            onUpdate = { next -> adjust(next) },
+                            onEditStart = { history.beginGesture(currentEdit()) },
+                            onEditEnd = { history.finishGesture(currentEdit()) },
                             onSeekPreview = { sec ->
                                 window?.let { startAudition((it.previewOrigin + sec).coerceAtLeast(0.0)) }
-                            }
+                            },
+                            editActions = editActions
                         )
-                        if (window == null) {
+                        if (shownWindow == null) {
                             Label("过渡需要至少 0.2 秒可用重叠，请移动切点或调整长度。", small = true)
-                        } else if (window.durationMs != window.nominalMs) {
-                            val seconds = "%.2f".format(window.durationMs / 1000.0)
-                            Label("实际重叠 $seconds 秒", small = true)
+                        } else if (shownWindow.durationMs != shownWindow.nominalMs) {
+                            val seconds = shownWindow.durationMs / 1000L
+                            Label(if (seconds == 0L) "实际重叠不到 1 秒" else "实际重叠 $seconds 秒", small = true)
                         }
                     }
 
                     SaltCard {
-                        Box(Modifier.fillMaxWidth()) {
-                            Box(Modifier.align(Alignment.Center)) {
-                                Label("过渡预设", small = true, color = skin.muted)
-                            }
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            BasicText(
+                                "过渡预设",
+                                style = SaltTheme.textStyles.main.copy(color = skin.text, fontWeight = FontWeight.Medium)
+                            )
                             if (reasons.isNotEmpty()) {
-                                Box(Modifier.align(Alignment.CenterEnd)) {
-                                    Chip(if (showReasons) "收起依据" else "分析依据", selected = showReasons, compact = true) {
-                                        showReasons = !showReasons
+                                Chip(if (showReasons) "收起依据" else "分析依据", selected = showReasons, compact = true, quiet = !showReasons) {
+                                    showReasons = !showReasons
+                                }
+                            }
+                        }
+
+                        BoxWithConstraints(Modifier.fillMaxWidth()) {
+                            val buttonCount = Plan.presets.size + if (autoPlan == null) 1 else 2
+                            val spacing = 5.dp
+                            val minTileWidth = with(LocalDensity.current) {
+                                (Plan.presets.maxOf { it.label.length } * 11).sp.toDp() + 12.dp
+                            }
+                            val contentWidth = maxOf(maxWidth, minTileWidth * buttonCount + spacing * (buttonCount - 1))
+                            Row(
+                                Modifier.horizontalScroll(rememberScrollState()).width(contentWidth),
+                                horizontalArrangement = Arrangement.spacedBy(spacing)
+                            ) {
+                                val presetTile = Modifier.weight(1f)
+                                EqualPresetTile("自定义", selected = isCustom, modifier = presetTile) {
+                                    setOpenParameter(null)
+                                    val next = when {
+                                        p.noMix -> p.copy(volume = "smooth", useHost = false)
+                                        p.useHost -> p.copy(useHost = false)
+                                        else -> p
+                                    }
+                                    adjust(next, selection = TransitionSelection(custom = true))
+                                }
+                                if (autoPlan != null) {
+                                    EqualPresetTile("自动", selected = isAutoSelected, modifier = presetTile) {
+                                        setOpenParameter(null)
+                                        autoPlan?.let { adjust(it, "已应用自动推荐", TransitionSelection()) }
+                                    }
+                                }
+                                for (preset in Plan.presets) {
+                                    EqualPresetTile(
+                                        preset.label,
+                                        selected = activePresetId == preset.id,
+                                        modifier = presetTile
+                                    ) {
+                                        setOpenParameter(null)
+                                        adjust(preset.apply(p), "预设：${preset.label}", TransitionSelection(presetId = preset.id))
                                     }
                                 }
                             }
                         }
 
-                        val isAutoMatch = autoPlan != null && p == autoPlan
-                        val matchedPreset = Plan.presets.firstOrNull { it.matches(p) }
-                        val isCustom = editingCustom || (matchedPreset == null && !isAutoMatch)
+                        if (!p.useHost && !p.noMix) {
+                            Row(
+                                Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                PlanParameterMenu(
+                                    parameter = TransitionParameter.EFFECT,
+                                    color = skin.muted,
+                                    selected = p.effect,
+                                    options = TransitionEffect.options,
+                                    modifier = Modifier.weight(1f),
+                                    selectedLabel = p.effect.label
+                                ) { p.copy(effect = it) }
 
-                        Row(
-                            Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            EqualPresetTile("自定义", selected = isCustom, modifier = Modifier.weight(1f)) {
-                                setOpenParameter(null)
-                                editingCustom = true
-                                if (p.useHost) adjust(p.copy(useHost = false))
-                            }
-                            if (autoPlan != null) {
-                                EqualPresetTile("自动", selected = !editingCustom && isAutoMatch, modifier = Modifier.weight(1f)) {
-                                    setOpenParameter(null)
-                                    editingCustom = false
-                                    autoPlan?.let { adjust(it, "已应用自动推荐") }
-                                }
-                            }
-                            for (preset in Plan.presets) {
-                                EqualPresetTile(
-                                    preset.label,
-                                    selected = !editingCustom && preset.matches(p) && !isAutoMatch,
+                                PlanParameterMenu(
+                                    parameter = TransitionParameter.LENGTH,
+                                    color = skin.accent,
+                                    selected = p.bars,
+                                    options = transitionLengths,
+                                    modifier = Modifier.weight(1f)
+                                ) { p.withBars(it, lengthA, lengthB) }
+
+                                SwitchTile(
+                                    barColor = palette.playhead,
+                                    title = "拍点磁吸",
+                                    checked = p.snap,
                                     modifier = Modifier.weight(1f)
                                 ) {
-                                    setOpenParameter(null)
-                                    editingCustom = false
-                                    adjust(preset.apply(p), "预设：${preset.label}")
+                                    val next = !p.snap
+                                    val nextPlan = p.copy(snap = next)
+                                    adjust(nextPlan, if (next) "已开启原速拍点磁吸" else "已关闭拍点磁吸")
                                 }
                             }
-                        }
 
-                        if (!p.useHost) {
                             Row(
                                 Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -2799,41 +3502,14 @@ private fun PairWorkspace(
                                     parameter = TransitionParameter.FILTER,
                                     color = palette.curveFilter,
                                     selected = p.filter,
-                                    options = Plan.filters,
+                                    options = Plan.filterOptions(liveHighPass),
                                     modifier = Modifier.weight(1f)
                                 ) { p.copy(filter = it) }
                             }
-
-                            Row(
-                                Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                PlanParameterMenu(
-                                    parameter = TransitionParameter.EFFECT,
-                                    color = skin.muted,
-                                    selected = p.echo,
-                                    options = transitionEffects,
-                                    modifier = Modifier.weight(1f)
-                                ) { p.copy(echo = it) }
-
-                                PlanParameterMenu(
-                                    parameter = TransitionParameter.LENGTH,
-                                    color = skin.accent,
-                                    selected = p.bars,
-                                    options = transitionLengths,
-                                    modifier = Modifier.weight(1f)
-                                ) { p.withBars(it, lengthA, lengthB) }
-
-                                SwitchTile(
-                                    barColor = palette.playhead,
-                                    title = "拍点磁吸",
-                                    checked = p.snap,
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    val next = !p.snap
-                                    adjust(p.copy(snap = next), if (next) "已开启原速拍点磁吸" else "已关闭拍点磁吸")
-                                }
+                            if (p.hasPreviewOnlyEffects(liveHighPass)) {
+                                val info = if (p.effect.reverb) "混响仅在编辑器试听时生效。"
+                                    else "标有「仅试听」的效果在编辑器试听时播放。"
+                                Label(info, small = true)
                             }
                         }
 
@@ -2845,13 +3521,10 @@ private fun PairWorkspace(
                         }
                     }
                 } else {
-                    SaltCard {
-                        Label("${a.title}  →  ${b.title} · $status", small = true)
-                    }
+                    WaveformPlaceholder("${a.title}  →  ${b.title} · $status")
                 }
             }
         }
-            Box(Modifier.width(0.5.dp).fillMaxHeight().background(skin.line))
             playlistPanel()
         }
     }

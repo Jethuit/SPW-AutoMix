@@ -50,6 +50,16 @@ internal class PlaylistCoverStore(
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<CoverKey, ImageBitmap?>) = size > 144
     }
 
+    fun peek(trackId: String, pixels: Int): ImageBitmap? {
+        val key = CoverKey(trackId, pixels.coerceIn(16, 128))
+        return synchronized(cache) { cache[key] }
+    }
+
+    fun hasCached(trackId: String, pixels: Int): Boolean {
+        val key = CoverKey(trackId, pixels.coerceIn(16, 128))
+        return synchronized(cache) { cache.containsKey(key) }
+    }
+
     suspend fun load(trackId: String, pixels: Int): ImageBitmap? = withContext(Dispatchers.IO) {
         val key = CoverKey(trackId, pixels.coerceIn(16, 128))
         slots.acquire()
@@ -96,12 +106,20 @@ internal class PlaylistCoverStore(
 @Composable
 internal fun PlaylistCover(trackId: String, store: PlaylistCoverStore, size: Dp) {
     val skin = LocalSkin.current
+    val entering = LocalAutoMixPageEntering.current
+    val closing = LocalAutoMixPageClosing.current
     val pixels = with(LocalDensity.current) { size.roundToPx() }
-    var image by remember(trackId, store, pixels) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(trackId, store, pixels) { image = store.load(trackId, pixels) }
+    var image by remember(trackId, store, pixels) { mutableStateOf(store.peek(trackId, pixels)) }
+    LaunchedEffect(trackId, store, pixels, entering, closing) {
+        if (entering || closing || store.hasCached(trackId, pixels)) {
+            if (image == null) image = store.peek(trackId, pixels)
+            return@LaunchedEffect
+        }
+        image = store.load(trackId, pixels)
+    }
     val shape = RoundedCornerShape(6.dp)
     Box(
-        Modifier.size(size).clip(shape).background(skin.surface).border(0.5.dp, skin.line, shape),
+        Modifier.size(size).clip(shape).background(skin.background).border(0.5.dp, skin.line, shape),
         contentAlignment = Alignment.Center
     ) {
         val bitmap = image

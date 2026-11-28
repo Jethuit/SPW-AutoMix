@@ -3,6 +3,7 @@ package automix
 import com.xuncorp.spw.workshop.api.PlaybackExtensionPoint.MediaItem
 import com.xuncorp.spw.workshop.api.hook.MethodHookParam
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
@@ -42,6 +43,7 @@ internal class HostPlayback(symbols: HostSymbols) {
     private val playlistReader = runCatching { HostPlaylistReader(symbols) }
     private val playlistCreation = runCatching { HostPlaylistCreation(symbols) }
     private val reschedule = runCatching { HostRescheduleTargets(symbols) }
+    val liveHighPass = MutableStateFlow(false)
     val planner get() = mix.getOrThrow().planner
     val canPlayTracks get() = trackPlayback.isSuccess
     val canReorderPlaylists get() = playlist.isSuccess
@@ -269,6 +271,10 @@ internal class HostPlayback(symbols: HostSymbols) {
             call.setResult(resultObj)
         }
 
+        fun installGapless() = install("GAPLESS", lenA, 0L, 0L, listOf(
+            gainPoint.newInstance(0.0, 1.0, 0.0), gainPoint.newInstance(1.0, 0.0, 1.0)
+        ))
+
         val fallbackEndA = if (nativeActive) minOf(lenA, nativeStart + nativeLength) else lenA
         val shortStart = maxOf(0L, fallbackEndA - if (nativeActive) min(nativeLength, shortLimit) else shortLimit)
         fun fallback(message: String? = null): String? {
@@ -277,9 +283,7 @@ internal class HostPlayback(symbols: HostSymbols) {
             val entry = max(0L, nativeEntry)
             val lengthMs = minOf(shortLimit, nativeLength, lenA - start, lenB - entry)
             if (lengthMs < 200L) {
-                install("GAPLESS", lenA, 0L, 0L, listOf(
-                    gainPoint.newInstance(0.0, 1.0, 0.0), gainPoint.newInstance(1.0, 0.0, 1.0)
-                ))
+                installGapless()
             } else {
                 val points = (0..48).map {
                     val t = it / 48.0
@@ -340,8 +344,13 @@ internal class HostPlayback(symbols: HostSymbols) {
         if (!p.valid()) {
             return fallback("曲对参数无效，使用原速回退")
         }
+        if (p.noMix) {
+            if (lenA <= 0L || lenB <= 0L) return "曲目时长不可用，沿用 SPW"
+            installGapless()
+            return "已接管 · 无过渡效果"
+        }
         fun supports(code: String) = spectral.invoke(call.args[4], code) == true
-        val applyEq = p.eq != "none" && spectralOK
+        val supportsEq = p.eq != "none" && !p.previewOnlyEq && spectralOK
         val applyFilter = p.filter != "none" && supports("filter_automation")
         val applyEcho = p.echo && supports("beat_synchronized_delay")
         val window = p.window(lenA, lenB)
@@ -361,15 +370,25 @@ internal class HostPlayback(symbols: HostSymbols) {
         fun add(i: Int, code: String, knots: List<Pair<Double, Double>>) {
             curves += envelope.newInstance(targets[i], code, knots.map { paramPoint.newInstance(it.first, it.second) })
         }
-        if (applyEq) {
+        var applyEq = false
+        if (supportsEq) {
             for (i in targets.indices) {
-                add(i, "low_shelf_gain_db", window.eqKnots(p, i))
+                val knots = window.eqKnots(p, i)
+                if (knots.isEmpty()) continue
+                add(i, "low_shelf_gain_db", knots)
+                applyEq = true
             }
         }
         if (applyFilter) {
+            val allowHighPass = liveHighPass.value
             for (i in targets.indices) {
+                val sweep = p.filterSweep(i) ?: continue
+                if (!sweep.lowPass && !allowHighPass) continue
                 val knots = window.filterKnots(p, i)
-                if (knots.isNotEmpty()) add(i, "low_pass_cutoff_hz", knots)
+                if (knots.isEmpty()) continue
+                // Unrecognized hosts clamp high values to the nearly open low-pass setting.
+                val nativeKnots = if (sweep.lowPass) knots else knots.map { (phase, cutoff) -> phase to HostHighPass.encode(cutoff) }
+                add(i, "low_pass_cutoff_hz", nativeKnots)
             }
         }
         if (applyEcho) {

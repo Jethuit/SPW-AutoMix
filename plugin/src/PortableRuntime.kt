@@ -2,6 +2,7 @@ package automix
 
 import java.io.OutputStream
 import java.nio.channels.FileChannel
+import java.nio.channels.FileLockInterruptionException
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
@@ -12,43 +13,53 @@ import java.nio.file.StandardOpenOption.WRITE
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.util.HexFormat
+import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.ZipInputStream
 
 internal object PortableRuntime {
     private const val executable = "ffmpeg.exe"
+    private val prepareLock = ReentrantLock()
     private val bundleId by lazy {
         val id = resource("automix-runtime.sha256").bufferedReader().use { it.readText().trim() }
         check(id.matches(Regex("[0-9a-f]{64}"))) { "内置音频运行环境缺少有效的校验值" }
         id
     }
 
-    @Synchronized
     fun prepare(directory: Path): Path {
         val root = directory.toAbsolutePath().normalize()
         val runtime = root.resolve(bundleId)
         if (ready(runtime)) return runtime
 
-        Files.createDirectories(root)
-        FileChannel.open(root.resolve("install.lock"), CREATE, WRITE).use { channel ->
-            channel.lock().use {
-                if (ready(runtime)) return runtime
-                val staging = Files.createTempDirectory(root, "install-")
-                try {
-                    unpack(staging)
-                    check(Files.isRegularFile(staging.resolve(executable))) { "内置 FFmpeg 文件不完整" }
-                    Files.createFile(staging.resolve(".ready"))
-                    deleteDirectory(runtime)
+        prepareLock.lockInterruptibly()
+        try {
+            if (ready(runtime)) return runtime
+            Files.createDirectories(root)
+            FileChannel.open(root.resolve("install.lock"), CREATE, WRITE).use { channel ->
+                channel.lock().use {
+                    if (ready(runtime)) return runtime
+                    val staging = Files.createTempDirectory(root, "install-")
                     try {
-                        Files.move(staging, runtime, ATOMIC_MOVE)
-                    } catch (_: AtomicMoveNotSupportedException) {
-                        Files.move(staging, runtime)
+                        unpack(staging)
+                        checkDspInterrupted()
+                        check(Files.isRegularFile(staging.resolve(executable))) { "内置 FFmpeg 文件不完整" }
+                        Files.createFile(staging.resolve(".ready"))
+                        deleteDirectory(runtime)
+                        try {
+                            Files.move(staging, runtime, ATOMIC_MOVE)
+                        } catch (_: AtomicMoveNotSupportedException) {
+                            Files.move(staging, runtime)
+                        }
+                    } finally {
+                        deleteDirectory(staging)
                     }
-                } finally {
-                    deleteDirectory(staging)
                 }
             }
+            return runtime
+        } catch (e: FileLockInterruptionException) {
+            throw InterruptedException("FFmpeg 安装已取消").apply { initCause(e) }
+        } finally {
+            prepareLock.unlock()
         }
-        return runtime
     }
 
     private fun ready(directory: Path): Boolean =

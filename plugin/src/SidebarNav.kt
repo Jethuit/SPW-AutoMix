@@ -33,10 +33,17 @@ import com.xuncorp.spw.workshop.api.hook.ComposableHook
 import com.xuncorp.spw.workshop.api.hook.MethodHook
 import com.xuncorp.spw.workshop.api.hook.MethodHookParam
 import com.xuncorp.spw.workshop.api.hook.UiHookCall
+import org.pf4j.PluginClassLoader
+import org.pf4j.PluginManager
+import org.pf4j.PluginState
 import java.lang.ref.WeakReference
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier as JModifier
+import java.util.IdentityHashMap
 import javax.swing.UIManager
+
+internal enum class AutoMixExitMotion { Return, Navigate }
+internal enum class AutoMixNavigationAction { Navigate, Replace, Forward }
 
 /** Host-composed standalone AutoMix page and navigation coordinator. */
 internal object AutoMixNav {
@@ -44,24 +51,49 @@ internal object AutoMixNav {
         val navigator: Any,
         val currentRoute: () -> Any?,
         val navigate: (Any) -> Unit,
-        val hasHostOverlay: () -> Boolean
+        val hasHostOverlay: () -> Boolean,
+        val forwardHistory: () -> List<Any?>?
     )
     private class OpenRequest(val host: Binding, val route: Any, val marker: Any)
+    internal class NavigationObservation(
+        val binding: Any,
+        val action: AutoMixNavigationAction,
+        val route: Any?,
+        val overlay: Boolean?,
+        val forwardHistory: List<Any?>?,
+        val opensAutoMix: Boolean,
+        val sameRoute: Boolean,
+        val statsMarkerCandidate: Boolean
+    )
 
     var visible by mutableStateOf(false)
         private set
+    var closing by mutableStateOf(false)
+        private set
+    var exitMotion by mutableStateOf(AutoMixExitMotion.Return)
+        private set
+    var nativeNavigation by mutableStateOf(true)
+        private set
+    var closeTicket by mutableStateOf(0L)
+        private set
+    var navigationTicket by mutableStateOf(0L)
+        private set
+    val navigating: Boolean get() = closing && exitMotion == AutoMixExitMotion.Navigate
+    val active: Boolean get() = visible && !closing
 
     private var binding: Binding? = null
     private var pending: OpenRequest? = null
+    private var presenter: Any? = null
     private val issuedMarkers = mutableListOf<WeakReference<Any>>()
 
     fun bindNavigator(
         navigator: Any,
         currentRoute: () -> Any?,
         navigate: (Any) -> Unit,
-        hasHostOverlay: () -> Boolean
+        hasHostOverlay: () -> Boolean,
+        forwardHistory: () -> List<Any?>? = { null }
     ): AutoCloseable {
-        val b = Binding(navigator, currentRoute, navigate, hasHostOverlay)
+        val b = Binding(navigator, currentRoute, navigate, hasHostOverlay, forwardHistory)
         binding = b
         pending = null
         return AutoCloseable {
@@ -72,13 +104,68 @@ internal object AutoMixNav {
         }
     }
 
+    fun attachPresenter(): AutoCloseable {
+        val token = Any()
+        presenter = token
+        return AutoCloseable {
+            if (presenter === token) {
+                presenter = null
+                if (closing) finishClose(closeTicket)
+            }
+        }
+    }
+
     fun close() {
         pending = null
+        resetVisibility()
+    }
+
+    private fun resetVisibility() {
+        closeTicket++
         visible = false
+        closing = false
+        nativeNavigation = true
+        exitMotion = AutoMixExitMotion.Return
+    }
+
+    fun finishClose(ticket: Long) {
+        if (closing && ticket == closeTicket) resetVisibility()
+    }
+
+    fun requestReturn() {
+        pending = null
+        if (visible && !closing) beginClose(AutoMixExitMotion.Return)
+    }
+
+    fun requestNavigation(native: Boolean) {
+        pending = null
+        if (!visible) return
+        nativeNavigation = native
+        navigationTicket++
+        beginClose(AutoMixExitMotion.Navigate)
+    }
+
+    private fun beginClose(motion: AutoMixExitMotion) {
+        if (presenter == null) {
+            resetVisibility()
+            return
+        }
+        closeTicket++
+        exitMotion = motion
+        closing = true
+    }
+
+    private fun open() {
+        pending = null
+        closeTicket++
+        exitMotion = AutoMixExitMotion.Return
+        nativeNavigation = true
+        closing = false
+        visible = true
     }
 
     fun requestOpen() {
-        if (visible) return
+        if (active) return
         val host = binding
         if (host == null) {
             WorkshopApi.ui.toast("AutoMix 页面导航尚未准备好，请稍后重试", WorkshopApi.Ui.ToastType.Warning)
@@ -87,7 +174,7 @@ internal object AutoMixNav {
         try {
             val route = host.currentRoute()
             if (route == null) {
-                visible = true
+                open()
                 return
             }
             val marker = copyHostRoute(route)
@@ -104,30 +191,59 @@ internal object AutoMixNav {
     private fun OpenRequest.matches(navigator: Any?, arg: Any?): Boolean =
         marker === arg && host === binding && host.navigator === navigator && host.currentRoute() === route
 
-    fun beforeNavigation(navigator: Any?, destination: Any?, isNavigate: Boolean): Boolean {
-        if (isNavigate && destination != null && issuedMarkers.any { it.get() === destination }) {
-            val request = pending
-            if (request?.matches(navigator, destination) == true) return false
-            // Another plugin can replay a canceled request after an asynchronous leave guard.
-            if (request?.marker === destination) pending = null
-            return true
-        }
-        if (navigator != null && navigator === binding?.navigator) close()
-        return false
+    private fun isIssuedMarker(destination: Any?): Boolean =
+        destination != null && issuedMarkers.any { it.get() === destination }
+
+    fun skipStaleMarker(navigator: Any?, destination: Any?, action: AutoMixNavigationAction): Boolean {
+        if (action != AutoMixNavigationAction.Navigate || !isIssuedMarker(destination)) return false
+        val request = pending
+        if (request?.matches(navigator, destination) == true) return false
+        // Another plugin can replay a canceled request after an asynchronous leave guard.
+        if (request?.marker === destination) pending = null
+        return true
     }
 
-    fun afterNavigate(navigator: Any?, destination: Any?) {
-        val request = pending ?: return
-        if (!request.matches(navigator, destination)) return
-        pending = null
-        visible = true
+    fun observeNavigation(navigator: Any?, destination: Any?, action: AutoMixNavigationAction): NavigationObservation? {
+        val host = binding?.takeIf { it.navigator === navigator } ?: return null
+        val opensAutoMix = action == AutoMixNavigationAction.Navigate && isIssuedMarker(destination)
+        if (!opensAutoMix) {
+            pending = null
+            if (!visible) return null
+        }
+        val route = host.currentRoute()
+        val sameRoute = action == AutoMixNavigationAction.Navigate && route != null && destination == route
+        val forward = action == AutoMixNavigationAction.Forward
+        return NavigationObservation(host, action, route,
+            if (forward) runCatching(host.hasHostOverlay).getOrNull() else null,
+            if (forward) runCatching(host.forwardHistory).getOrNull() else null,
+            opensAutoMix, sameRoute, !opensAutoMix && sameRoute && destination !== route)
+    }
+
+    fun completeNavigation(observation: NavigationObservation, navigator: Any?, destination: Any?) {
+        val host = binding?.takeIf { it === observation.binding && it.navigator === navigator } ?: return
+        if (observation.opensAutoMix) {
+            if (pending?.matches(navigator, destination) == true) open()
+            return
+        }
+        if (!visible) return
+        if (observation.action == AutoMixNavigationAction.Forward) {
+            val routeUnchanged = observation.route === host.currentRoute()
+            val overlayUnchanged = observation.overlay == runCatching(host.hasHostOverlay).getOrNull()
+            val currentHistory = runCatching(host.forwardHistory).getOrNull()
+            val oldHistory = observation.forwardHistory
+            val historyUnchanged = oldHistory == null || currentHistory == null ||
+                (oldHistory.size == currentHistory.size && oldHistory.indices.all { oldHistory[it] === currentHistory[it] })
+            if (routeUnchanged && overlayUnchanged && historyUnchanged) return
+        }
+        requestNavigation(native = !observation.sameRoute)
     }
 
     fun consumeBack(navigator: Any): Boolean {
+        val host = binding?.takeIf { it.navigator === navigator } ?: return false
+        pending = null
         if (!visible) return false
-        val host = binding
-        if (host != null && (host.navigator !== navigator || host.hasHostOverlay())) return false
-        close()
+        if (host.hasHostOverlay()) return false
+        requestReturn()
         return true
     }
 
@@ -147,17 +263,34 @@ internal object AutoMixNav {
     }
 }
 
-internal class AutoMixNavigationHook(private val isNavigate: Boolean, private val isActive: () -> Boolean) : MethodHook(90) {
+internal class AutoMixNavigationHook(
+    private val action: AutoMixNavigationAction,
+    private val isActive: () -> Boolean,
+    private val statsVisible: () -> Boolean? = { null }
+) : MethodHook(90) {
+    private class Call(val navigation: AutoMixNav.NavigationObservation, val statsWasVisible: Boolean?)
+    private val observations = IdentityHashMap<MethodHookParam, Call>()
+
     override fun before(call: MethodHookParam) {
-        if (isActive() && AutoMixNav.beforeNavigation(call.thisObject, call.args.firstOrNull(), isNavigate)) {
+        if (!isActive()) return
+        val destination = call.args.firstOrNull()
+        if (AutoMixNav.skipStaleMarker(call.thisObject, destination, action)) {
+            // Let the other page hooks see the navigation, then suppress stale replays.
             call.setResult(null)
+            return
         }
+        val observed = AutoMixNav.observeNavigation(call.thisObject, destination, action) ?: return
+        observations[call] = Call(observed, if (observed.statsMarkerCandidate) statsVisible() else null)
     }
 
     override fun after(call: MethodHookParam) {
-        // The host returns early for this equal route. Other plugins still see an accepted call.
-        if (isNavigate && isActive() && !call.isOriginalSkipped && call.throwable == null) {
-            AutoMixNav.afterNavigate(call.thisObject, call.args.firstOrNull())
+        val observed = observations.remove(call) ?: return
+        if (!isActive() || call.throwable != null) return
+        // Listen Stats consumes its own route marker; confirm that it actually opened.
+        val statsOpened = call.isOriginalSkipped && observed.navigation.statsMarkerCandidate &&
+            observed.statsWasVisible != true && statsVisible() == true
+        if (!call.isOriginalSkipped || statsOpened) {
+            AutoMixNav.completeNavigation(observed.navigation, call.thisObject, call.args.firstOrNull())
         }
     }
 }
@@ -254,13 +387,40 @@ internal class SidebarBridge(symbols: HostSymbols) {
 
     fun hasHostOverlay(nav: Any): Boolean = navigation.hasOverlay(nav, currentRoute(nav))
 
+    fun forwardHistory(nav: Any): List<Any?>? = navigation.forwardHistory(nav)
+
+    private fun listenStatsVisible(): Boolean? = runCatching {
+        val loader = SidebarBridge::class.java.classLoader as? PluginClassLoader ?: return null
+        val managerField = PluginClassLoader::class.java.getDeclaredField("pluginManager").apply { trySetAccessible() }
+        val manager = managerField.get(loader) as? PluginManager ?: return null
+        val wrapper = manager.getPlugin("com.jethuit.spw.listenstats")
+            ?.takeIf { it.pluginState == PluginState.STARTED } ?: return null
+        val stateClass = Class.forName(
+            "com.jethuit.spw.listenstats.ui.StatsHostState",
+            false,
+            wrapper.pluginClassLoader
+        )
+        val instance = stateClass.getField("INSTANCE").get(null)
+        val visible = stateClass.getMethod("getVisible").invoke(instance) as? Boolean ?: return null
+        val closing = runCatching { stateClass.getMethod("getClosing").invoke(instance) as? Boolean }.getOrNull() == true
+        visible && !closing
+    }.getOrNull()
+
     fun register(plugin: MainPlugin, isActive: () -> Boolean): List<AutoCloseable> {
         val added = mutableListOf<AutoCloseable>()
         try {
             val registrar = WorkshopApi.hookRegistrar
-            for (method in listOf(navigation.navigateMethod, navigation.replaceMethod, navigation.forwardMethod)) {
-                added += registrar.hookMethod(method.declaringClass.name, method.name,
-                    method.parameterTypes.map { it.name }, AutoMixNavigationHook(method == navigation.navigateMethod, isActive))
+            for ((method, action) in listOf(
+                navigation.navigateMethod to AutoMixNavigationAction.Navigate,
+                navigation.replaceMethod to AutoMixNavigationAction.Replace,
+                navigation.forwardMethod to AutoMixNavigationAction.Forward
+            )) {
+                added += registrar.hookMethod(
+                    method.declaringClass.name,
+                    method.name,
+                    method.parameterTypes.map { it.name },
+                    AutoMixNavigationHook(action, isActive, ::listenStatsVisible)
+                )
             }
 
             val back = navigation.backMethod
@@ -289,7 +449,13 @@ internal class SidebarBridge(symbols: HostSymbols) {
                         listOf("androidx.compose.ui.Modifier", "kotlin.jvm.functions.Function3"), 40,
                         object : ComposableHook() {
                             @Composable override fun Content(call: UiHookCall) {
-                                bridge.Render(call.getArgument(0) as Modifier, requireNotNull(call.getArgument(1)), isActive)
+                                bridge.Render(
+                                    call.getArgument(0) as Modifier,
+                                    requireNotNull(call.getArgument(1)),
+                                    isActive
+                                ) {
+                                    AutoMixPage(plugin, this@SidebarBridge.skin(currentComposer))
+                                }
                             }
                         })
                 }
@@ -321,7 +487,7 @@ internal class SidebarBridge(symbols: HostSymbols) {
                                 val item = call.getArgument(0)
                                 val local = masker.local
                                 val current = local.current
-                                val mask = isActive() && AutoMixNav.visible
+                                val mask = isActive() && AutoMixNav.active
                                 val neutral = remember(current) {
                                     current?.let { runCatching { masker.unselected(it) }.getOrNull() }
                                 }
@@ -378,7 +544,7 @@ private fun AutoMixSidebarIcon() {
 
 @Composable
 private fun AutoMixSidebarButton(control: Method) {
-    val active = AutoMixNav.visible
+    val active = AutoMixNav.active
     val modifier = Modifier
         .semantics { contentDescription = "AutoMix"; selected = active }
         .clickable { AutoMixNav.requestOpen() }
@@ -404,13 +570,14 @@ private fun AutoMixOverlay(plugin: MainPlugin, bridge: SidebarBridge) {
                 navigator = nav,
                 currentRoute = { bridge.currentRoute(nav) },
                 navigate = { route -> bridge.navigate(nav, route) },
-                hasHostOverlay = { bridge.hasHostOverlay(nav) }
+                hasHostOverlay = { bridge.hasHostOverlay(nav) },
+                forwardHistory = { bridge.forwardHistory(nav) }
             )
         }
         onDispose { handle?.close() }
     }
-    if (!AutoMixNav.visible) return
-    Box(Modifier.fillMaxSize()) {
+    if (!AutoMixNav.visible || bridge.backdrop?.isMounted == true) return
+    AutoMixPageMotion {
         AutoMixPage(plugin, bridge.skin(composer))
     }
 }
@@ -429,6 +596,6 @@ private fun AutoMixPage(plugin: MainPlugin, skin: Skin) {
             .padding(bottom = 84.dp)
             .pointerInput(Unit) { detectTapGestures {} }
     ) {
-        NativeEditor(plugin, skin, onBack = { AutoMixNav.close() })
+        NativeEditor(plugin, skin, onBack = { AutoMixNav.requestReturn() })
     }
 }

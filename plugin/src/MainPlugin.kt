@@ -5,6 +5,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import com.xuncorp.spw.workshop.api.*
+import com.xuncorp.spw.workshop.api.config.ConfigHelper
 import com.xuncorp.spw.workshop.api.hook.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -21,17 +22,22 @@ import kotlinx.serialization.json.*
 import java.awt.EventQueue
 
 class MainPlugin(context: PluginContext) : SpwPlugin(context) {
-    private class Activation(val worker: Worker) {
+    private class Activation(val worker: Worker, version: String, openUpdateConfig: () -> ConfigHelper,
+                             onUpdate: (AutoMixReleaseCheck.Available) -> Unit) {
         val handles = mutableListOf<AutoCloseable>() // EDT only
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val updates = AutoMixUpdates(version, scope, openSettings = openUpdateConfig, onUpdate = onUpdate)
         var discovery: Thread? = null
         @Volatile var upcoming: UpcomingTransition? = null
         @Volatile var position: Pair<String, Long>? = null
         @Volatile var automatic: PreparedAutoMix? = null
+        val uiCache = AutoMixUiCache()
     }
 
     @Volatile private var activation: Activation? = null
-    private val config by lazy { WorkshopApi.manager.createConfigManager().getConfig("pairs.json") }
+    private val configManager by lazy { WorkshopApi.manager.createConfigManager() }
+    private val config by lazy { configManager.getConfig("pairs.json") }
+    private val updateConfig by lazy { configManager.getConfig("updates.json") }
     private val statusState = mutableStateOf("等待宿主接入")
     private val savedPlans = MutableStateFlow(emptyMap<String, Plan>())
     internal val plans = savedPlans.asStateFlow()
@@ -40,6 +46,9 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
     private val availableHost = MutableStateFlow<HostPlayback?>(null)
     internal val hosts = availableHost.asStateFlow()
     internal val bridge get() = availableHost.value
+    internal val updates get() = activation?.updates
+    internal val uiCache: AutoMixUiCache get() = activation?.uiCache ?: fallbackUiCache
+    private val fallbackUiCache = AutoMixUiCache()
     internal lateinit var worker: Worker
         private set
 
@@ -78,7 +87,14 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
         worker = Worker(config.getConfigPath().parent.resolve("analysis")) {
             WorkshopApi.playback.pause()
         }
-        val state = Activation(worker)
+        val state = Activation(worker, pluginContext.pluginVersion, { updateConfig }) { release ->
+            EventQueue.invokeLater {
+                val notice = updates?.notice?.value
+                if (notice?.enabled == true && notice.available == release) {
+                    runCatching { WorkshopApi.ui.toast("AutoMix 有新版本 v${release.version}，可在「关于」中查看。", WorkshopApi.Ui.ToastType.Success) }
+                }
+            }
+        }
         activation = state
         current = this
         running = true
@@ -88,6 +104,7 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
             savedPlans.value = Json.parseToJsonElement(config.get("plans","{}")).jsonObject.mapNotNull { (k,v) ->
                 runCatching { Plan.read(v.jsonObject) }.getOrNull()?.takeIf { it.valid() }?.let { k to it }
             }.toMap()
+            state.updates.start()
             updateStatus(state, "正在识别 SPW ${pluginContext.spwVersion} 的宿主接口…")
             val loader = WorkshopApi.instance.javaClass.classLoader
             state.discovery = Thread({
@@ -95,7 +112,8 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
                     val symbols = HostSymbols.read(HostSymbols.source(loader), loader)
                     val playback = HostPlayback(symbols)
                     val sidebar = runCatching { SidebarBridge(symbols) }
-                    EventQueue.invokeLater { install(state, playback, sidebar) }
+                    val liveEffects = runCatching { HostLiveFxTargets(symbols) }
+                    EventQueue.invokeLater { install(state, playback, sidebar, liveEffects) }
                 } catch (failure: Exception) {
                     updateStatus(state, "接入未启用 · ${failure.detail()}")
                 } catch (failure: LinkageError) {
@@ -159,7 +177,12 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
         }
     }
 
-    private fun install(state: Activation, host: HostPlayback, sidebar: Result<SidebarBridge>) {
+    private fun install(
+        state: Activation,
+        host: HostPlayback,
+        sidebar: Result<SidebarBridge>,
+        liveEffects: Result<HostLiveFxTargets>
+    ) {
         if (activation !== state) return
         try {
             checkPermission()
@@ -182,6 +205,26 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
                     }
                 })
         }
+        if (transition.isSuccess) liveEffects.onSuccess { effects ->
+            val target = effects.lowPassParameters
+            runCatching {
+                state.handles += WorkshopApi.hookRegistrar.hookMethod(target.declaringClass.name, target.name,
+                    target.parameterTypes.map { it.name }, object : MethodHook(50) {
+                        override fun after(call: MethodHookParam) {
+                            if (activation !== state || call.throwable != null || !host.liveHighPass.value) return
+                            val cutoff = (call.args.getOrNull(0) as? Double)?.let(HostHighPass::decode) ?: return
+                            // Workshop advice leaves the returned reference in place; if rewriting fails, the host's
+                            // clamped 18 kHz low-pass buffer remains valid as a safe fallback.
+                            val updated = runCatching { HostBassLiveFilter.writeHighPass(call.result, cutoff) }
+                                .getOrDefault(false)
+                            if (!updated && host.liveHighPass.compareAndSet(true, false)) {
+                                updateStatus(state, "高通仅试听 · 宿主滤波接入失效")
+                            }
+                        }
+                    })
+                host.liveHighPass.value = true
+            }.onFailure { System.err.println("AutoMix 实播高通接入失败 · ${it.detail()}") }
+        }
         val navigation = sidebar.mapCatching { entry ->
             state.handles += entry.register(this) { activation === state }
             entry.sidebarWarning
@@ -191,7 +234,8 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
             availableHost.value = host
         }
         val messages = listOfNotNull(
-            transition.fold({ "切歌时自动接管" }, { "过渡未接入 · ${it.detail()}" }),
+            transition.fold({ if (host.liveHighPass.value) "切歌时自动接管 · 支持高通" else "切歌时自动接管" },
+                { "过渡未接入 · ${it.detail()}" }),
             navigation.fold({ warning -> warning?.let { "侧栏不可用，可从模组配置打开 · $it" } },
                 { "编辑器未接入 · ${it.detail()}" }),
             host.warnings.filterNot { it.startsWith("过渡 · ") }.takeIf(List<String>::isNotEmpty)?.joinToString(" · ")

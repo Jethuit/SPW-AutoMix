@@ -1,6 +1,7 @@
 package automix
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.runInterruptible
 import java.io.ByteArrayInputStream
 import java.io.IOException
@@ -9,6 +10,7 @@ import java.util.concurrent.locks.ReentrantLock
 import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.Clip
 import javax.sound.sampled.LineEvent
+import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
 
 internal data class TrackAnalysisMetadata(val bpm: Double?, val keyName: String?, val camelot: String?) {
@@ -47,6 +49,7 @@ internal class Worker(
 ) {
     private val requests = ReentrantLock()
     private var activeThread: Thread? = null
+    private var activePreview = false
     private var clip: Clip? = null
     private var closed = false
     private var hostPlaying: Boolean? = null
@@ -55,7 +58,12 @@ internal class Worker(
         if (Worker::class.java.getResource("/automix-system-runtime") != null) {
             System.getenv("AUTOMIX_FFMPEG")?.takeIf { it.isNotBlank() } ?: "ffmpeg"
         } else {
-            PortableRuntime.prepare(cache.resolveSibling("runtime")).resolve("ffmpeg.exe").toString()
+            try {
+                PortableRuntime.prepare(cache.resolveSibling("runtime")).resolve("ffmpeg.exe").toString()
+            } catch (e: IOException) {
+                checkDspInterrupted()
+                throw AudioRuntimeException("无法准备 FFmpeg · ${e.message}", e)
+            }
         }
     }
     private val tracks = DspTrackCache(cache) { ffmpeg }
@@ -65,16 +73,21 @@ internal class Worker(
     private var cachedKey: PreviewKey? = null
     private var cachedWav: ByteArray? = null
 
-    private fun <T> process(action: () -> T): T {
+    private fun <T> process(preview: Boolean = false, action: () -> T): T {
         requests.lockInterruptibly()
         try {
             synchronized(this) {
                 check(!closed) { "插件已停用" }
                 activeThread = Thread.currentThread()
+                activePreview = preview
             }
+            checkDspInterrupted()
             return action()
         } finally {
-            synchronized(this) { activeThread = null }
+            synchronized(this) {
+                activeThread = null
+                activePreview = false
+            }
             requests.unlock()
         }
     }
@@ -86,6 +99,7 @@ internal class Worker(
 
     @Synchronized fun stopPreview() {
         audition++
+        if (activePreview) activeThread?.interrupt()
         val old = clip
         clip = null
         old?.stop()
@@ -157,11 +171,14 @@ internal class Worker(
         var firstError: String? = null
         var analyzed = 0
         for ((index, path) in paths.withIndex()) {
+            coroutineContext.ensureActive()
             if (path != null) {
                 try {
                     runInterruptible(Dispatchers.IO) { process { tracks.profile(path) } }
                     analyzed++
                 } catch (e: IOException) {
+                    coroutineContext.ensureActive()
+                    if (e is AudioRuntimeException) throw e
                     if (firstError == null) firstError = e.message ?: "音频解码失败"
                 } catch (e: IllegalArgumentException) {
                     if (firstError == null) firstError = e.message ?: "音频分析失败"
@@ -202,7 +219,7 @@ internal class Worker(
             audition to cachedWav?.takeIf { cachedKey == key }
         }
 
-        val wav = hitBytes ?: process {
+        val wav = hitBytes ?: process(preview = true) {
             synchronized(this) { check(audition == ticket) { "试听已取消" } }
             val first = tracks.profile(a)
             val second = tracks.profile(b)
