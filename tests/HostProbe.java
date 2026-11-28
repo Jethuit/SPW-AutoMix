@@ -598,7 +598,7 @@ class HostProbe {
 
         var recommendedPlan = new Plan(147., 2., 100., 100., 4, "overlap", true, .5,
             "low-out", TransitionEffect.None, "bass-swap", true, false);
-        var recommendation = new PreparedAutoMix("1:AB", recommendedPlan);
+        var recommendation = new PreparedAutoMix("1:AB", recommendedPlan, MixAlgorithm.Spotify);
         call.args[1] = track("B");
         call.result = arranged(baseline);
         var applied = bridge.apply(call, Map.of(), recommendation);
@@ -615,13 +615,26 @@ class HostProbe {
         if (!targets.getCueA().get(transitionFrom(call.result)).equals(155000L))
             throw new AssertionError("Automatic playback replaced a saved edit");
 
+        var relationship = host("TrackRelationship").getConstructor().newInstance();
+        var relationshipType = symbols.named(MIX + "TrackRelationship");
+        symbols.field(relationshipType.dataField("gaplessPreferred", "Z")).setBoolean(relationship, true);
+        call.args[5] = relationship;
+        call.result = arranged(gapless);
+        bridge.apply(call, Map.of(), recommendation);
+        if (transitionFrom(call.result) != gapless)
+            throw new AssertionError("Automatic Spotify transition replaced a continuous album boundary");
+        bridge.apply(call, saved, recommendation);
+        if (transitionFrom(call.result) == gapless)
+            throw new AssertionError("Continuous album protection replaced an explicitly saved transition");
+        call.args[5] = null;
+
         call.result = arranged(nativeMatched);
         bridge.apply(call, Map.of("1:AB", nativePlan), recommendation);
         if (transitionFrom(call.result) != nativeMatched)
             throw new AssertionError("Automatic playback replaced an explicit host override");
 
         call.result = arranged(baseline);
-        bridge.apply(call, Map.of(), new PreparedAutoMix("1:AC", recommendedPlan));
+        bridge.apply(call, Map.of(), new PreparedAutoMix("1:AC", recommendedPlan, MixAlgorithm.Spotify));
         if (targets.getCueA().get(transitionFrom(call.result)).equals(147000L))
             throw new AssertionError("A recommendation was applied to a different pair");
         call.result = arranged(nativeMatched);
@@ -640,18 +653,20 @@ class HostProbe {
         var library=List.of(libraryItem("A"),libraryItem("B"),libraryItem("C"));
         var normal=List.of(a,missing,b,c);
         var shuffle=bridge.queueView(queue("Random",normal,0,List.of(b,a,c,missing),1),library);
-        if(shuffle.getOrder().size()!=4 || shuffle.getEntries().get(1).getRawIndex()!=2 ||
-           !shuffle.getNextPair().getSecond().getId().equals("C"))
-            throw new AssertionError("Lost raw indices or ignored shuffle order");
+        if (!shuffle.getShuffled() || !shuffle.getOrder().equals(List.of(12, 10, 13, 11)) ||
+            !shuffle.getEntries().stream().map(QueueTrackEntry::getQueueId).toList().equals(List.of(12, 10, 13)) ||
+            shuffle.getCurrentIndex() != 1 || shuffle.getEntries().get(1).getDisplayIndex() != 1 ||
+            !shuffle.getNextPair().getSecond().getId().equals("C"))
+            throw new AssertionError("Displayed queue, current index or transition did not follow shuffle order");
         var repeatA = queueItem(14, "A");
         var repeated = queue("Random", List.of(a, missing, b, repeatA, c), 0, List.of(repeatA, b, a, c, missing), 0);
         var queueTargets = new HostQueueTargets(symbols);
-        var clicked = bridge.queueView(repeated, library).getEntries().get(2);
+        var clicked = bridge.queueView(repeated, library).getEntries().getFirst();
         var reordered = queue("Circle", List.of(a, repeatA, missing, b, c), 0, List.of(), -1);
         var replaced = queue("Circle", List.of(a, queueItem(14, "B"), missing, b, c), 0, List.of(), -1);
         if (!bridge.getCanPlayTracks() || clicked.getQueueId() != 14 ||
-            !Objects.equals(queueTargets.playbackIndex(repeated, clicked), 3) ||
-            !Objects.equals(queueTargets.playbackIndex(reordered, clicked), 1) ||
+            !Objects.equals(queueTargets.playbackIndex(repeated, clicked), new kotlin.Pair<>(0, true)) ||
+            !Objects.equals(queueTargets.playbackIndex(reordered, clicked), new kotlin.Pair<>(1, false)) ||
             queueTargets.playbackIndex(replaced, clicked) != null)
             throw new AssertionError("Direct playback lost the selected queue entry or used a stale index");
         if(bridge.queueView(queue("CircleEnd",normal,0,List.of(),-1),library).getNextPair()!=null ||
@@ -665,7 +680,32 @@ class HostProbe {
             bridge.upcomingTransition(queue("RepeatOne", normal, 2, List.of(), -1)) != null ||
             bridge.upcomingTransition(queue("CircleEnd", normal, 3, List.of(), -1)) != null)
             throw new AssertionError("Background preparation did not follow playback order");
+        var lookahead = bridge.followingTracks(queue("Random", normal, 0, List.of(b, a, c, missing), 0), 3);
+        if (!lookahead.stream().map(PlaybackTrack::getId).toList().equals(List.of("A", "C", "missing")) ||
+            !bridge.followingTracks(queue("Circle", normal, 3, List.of(), -1), 2)
+                .stream().map(PlaybackTrack::getId).toList().equals(List.of("A", "missing")))
+            throw new AssertionError("Pre-analysis did not follow host playback order");
+        var directQueue = List.of(a, b, c);
+        var beforeAdvance = bridge.queueView(queue("CircleEnd", directQueue, 0, List.of(), -1), library);
+        var afterAdvance = bridge.queueView(queue("CircleEnd", directQueue, 1, List.of(), -1), library);
+        var terminal = bridge.queueView(queue("CircleEnd", directQueue, 2, List.of(), -1), library);
+        var current = EditorPair.Companion.displayed(beforeAdvance, null);
+        var advanced = EditorPair.Companion.displayed(afterAdvance, null);
+        var exhausted = EditorPair.Companion.displayed(terminal, null);
+        var randomPair = EditorPair.Companion.displayed(shuffle, null);
+        if (!current.getOutgoing().getId().equals("A") || !current.getIncoming().getId().equals("B") ||
+            !advanced.getOutgoing().getId().equals("B") || !advanced.getIncoming().getId().equals("C") ||
+            exhausted.getOutgoing() != null || exhausted.getIncoming() != null ||
+            !randomPair.getOutgoing().getId().equals("A") || !randomPair.getIncoming().getId().equals("C"))
+            throw new AssertionError("The following editor did not update or clear its active pair with the host queue");
+        var pinned = new EditorPair(library.get(0), library.get(1), new kotlin.Pair<>("10", "12"));
+        var incomplete = new EditorPair(library.get(1), null, null);
+        if (EditorPair.Companion.displayed(afterAdvance, pinned) != pinned ||
+            EditorPair.Companion.displayed(terminal, incomplete) != incomplete)
+            throw new AssertionError("A host update replaced a manually selected editor pair");
+
         System.out.println("PASS Workshop binding, original-speed saved/automatic plans, short fade, host mode and queue modes");
+        System.out.println("PASS editor follows queue advances, clears at queue end, and preserves manual selections");
 
         var smoothPlan = new Plan(10., 0., 120., 120., 4, "smooth", false, .5, "none", TransitionEffect.None, "none", false, false);
         var smoothWindow = smoothPlan.window(180000L, 180000L);

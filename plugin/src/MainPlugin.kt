@@ -41,6 +41,8 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
     private val statusState = mutableStateOf("等待宿主接入")
     private val savedPlans = MutableStateFlow(emptyMap<String, Plan>())
     internal val plans = savedPlans.asStateFlow()
+    private val selectedAlgorithm = MutableStateFlow(MixAlgorithm.Original)
+    internal val algorithm = selectedAlgorithm.asStateFlow()
     internal val drafts = mutableStateMapOf<String, Plan>()
     @Volatile internal var running = false
     private val availableHost = MutableStateFlow<HostPlayback?>(null)
@@ -82,6 +84,19 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
         bridge?.rescheduleAutomix(key)
     }
 
+    @Synchronized internal fun selectAlgorithm(next: MixAlgorithm) {
+        check(running)
+        val previous = algorithm.value
+        if (next == previous) return
+        config.set("algorithm", next.name)
+        if (!config.save()) {
+            config.set("algorithm", previous.name)
+            error("算法设置写入失败")
+        }
+        selectedAlgorithm.value = next
+        bridge?.rescheduleAutomix()
+    }
+
     @Synchronized override fun start() {
         if (activation != null) return
         worker = Worker(config.getConfigPath().parent.resolve("analysis")) {
@@ -101,6 +116,8 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
         try {
             checkPermission()
             config.reload()
+            val storedAlgorithm = config.get("algorithm", MixAlgorithm.Original.name)
+            selectedAlgorithm.value = MixAlgorithm.entries.firstOrNull { it.name == storedAlgorithm } ?: MixAlgorithm.Original
             savedPlans.value = Json.parseToJsonElement(config.get("plans","{}")).jsonObject.mapNotNull { (k,v) ->
                 runCatching { Plan.read(v.jsonObject) }.getOrNull()?.takeIf { it.valid() }?.let { k to it }
             }.toMap()
@@ -143,35 +160,58 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
     private fun prepareUpcoming(state: Activation, host: HostPlayback) {
         val queue = runCatching { host.queueStates() }.getOrNull() ?: return
         state.scope.launch {
-            combine(queue, plans) { value, saved ->
-                host.upcomingTransition(value)?.takeUnless { it.key in saved }
-            }.distinctUntilChanged().collectLatest { pair ->
+            combine(queue, plans, algorithm) { value, saved, mode ->
+                host.upcomingTransition(value)?.takeUnless { it.key in saved } to mode
+            }.distinctUntilChanged().collectLatest { (pair, mode) ->
                 state.upcoming = pair
                 state.automatic = null
                 if (pair == null) return@collectLatest
                 val plan = try {
-                    state.worker.planPair(pair.from.path, pair.to.path)
+                    state.worker.planPair(pair.from.path, pair.to.path, mode)
                 } catch (failure: CancellationException) {
                     throw failure
                 } catch (failure: Exception) {
-                    if (activation === state && host.upcomingTransition(queue.value) == pair && pair.key !in plans.value) {
+                    if (activation === state && algorithm.value == mode &&
+                        host.upcomingTransition(queue.value) == pair && pair.key !in plans.value) {
                         updateStatus(state, "自动分析失败 · ${failure.detail().take(120)}")
                     }
                     return@collectLatest
                 }
-                if (activation !== state || host.upcomingTransition(queue.value) != pair || pair.key in plans.value) {
+                if (activation !== state || algorithm.value != mode ||
+                    host.upcomingTransition(queue.value) != pair || pair.key in plans.value) {
                     return@collectLatest
                 }
-                val prepared = PreparedAutoMix(pair.key, plan)
+                val prepared = PreparedAutoMix(pair.key, plan, mode)
                 state.automatic = prepared
                 EventQueue.invokeLater {
-                    if (activation !== state || state.automatic !== prepared ||
+                    if (activation !== state || algorithm.value != mode || state.automatic !== prepared ||
                         host.upcomingTransition(queue.value) != pair || pair.key in plans.value) return@invokeLater
                     val position = host.currentPositionMs()?.takeIf { it.first == pair.from.id }?.second
                         ?: state.position?.takeIf { it.first == pair.from.id }?.second
                     val start = (plan.cueA + (-plan.cueB).coerceAtLeast(0.0)) * 1000.0
                     // With no position yet, the planner still checks Pisces' actual position before applying the cue.
                     if (position == null || position + HostPlayback.MIN_LEAD_MS < start) host.rescheduleAutomix(pair.key)
+                }
+            }
+        }
+    }
+
+    private fun preAnalyzeFollowing(state: Activation, host: HostPlayback) {
+        state.scope.launch {
+            combine(host.queueStates(), algorithm) { queue, mode ->
+                if (mode == MixAlgorithm.Spotify) host.followingTracks(queue, 3).drop(1) else emptyList()
+            }.distinctUntilChanged().collectLatest { tracks ->
+                // Yield the first I/O slot to the imminent pair and avoid decoding an entire queue.
+                if (tracks.isEmpty()) return@collectLatest
+                kotlinx.coroutines.delay(1500)
+                for (track in tracks) {
+                    try {
+                        state.worker.preAnalyze(track.path, MixAlgorithm.Spotify)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // Upcoming playback can still retry the analysis or use its host fallback.
+                    }
                 }
             }
         }
@@ -198,7 +238,8 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
                     override fun after(call: MethodHookParam) {
                         if (activation !== state || call.throwable != null) return
                         try {
-                            host.apply(call, plans.value, state.automatic)?.let { updateStatus(state, it) }
+                            val prepared = state.automatic?.takeIf { it.algorithm == algorithm.value }
+                            host.apply(call, plans.value, prepared)?.let { updateStatus(state, it) }
                         } catch (failure: Exception) {
                             updateStatus(state, "已保留宿主过渡 · ${failure.detail()}")
                         }
@@ -243,6 +284,7 @@ class MainPlugin(context: PluginContext) : SpwPlugin(context) {
         updateStatus(state, messages.joinToString(" · "))
         if (transition.isSuccess && activation === state) {
             prepareUpcoming(state, host)
+            preAnalyzeFollowing(state, host)
             if (plans.value.isNotEmpty()) host.rescheduleAutomix()
         }
     }

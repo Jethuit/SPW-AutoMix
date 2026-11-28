@@ -1,6 +1,8 @@
 package automix
 
 import kotlinx.serialization.json.*
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.IOException
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
@@ -28,6 +30,17 @@ internal class DspTrackCache(private val directory: Path, private val ffmpeg: ()
             val id = "[$escaped, $size, $modifiedNanos, \"$version\"]"
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(id.toByteArray(Charsets.UTF_8)))
         }
+    }
+
+    private val profiles = object : LinkedHashMap<Source, DspProfile>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Source, DspProfile>) = size > 128
+    }
+    private val mixFeatures = object : LinkedHashMap<Source, DspMixFeatures>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Source, DspMixFeatures>) = size > 24
+    }
+
+    private val waveforms = object : LinkedHashMap<Source, DspWaveform>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Source, DspWaveform>) = size > 8
     }
 
     private data class Paths(val profile: Path, val waveform: Path)
@@ -61,6 +74,13 @@ internal class DspTrackCache(private val directory: Path, private val ffmpeg: ()
     }
 
     private fun cachedProfile(track: Source): DspProfile? {
+        synchronized(profiles) { profiles[track] }?.let { return it }
+        val profile = readCachedProfile(track) ?: return null
+        synchronized(profiles) { profiles[track] = profile }
+        return profile
+    }
+
+    private fun readCachedProfile(track: Source): DspProfile? {
         val current = paths(track)
         val previous = paths(track, "analysis-wave-v4")
         for (entry in listOf(current, previous)) {
@@ -72,13 +92,16 @@ internal class DspTrackCache(private val directory: Path, private val ffmpeg: ()
 
     fun track(path: String): DspTrack {
         val track = source(path)
+        waveforms[track]?.let { wave -> cachedProfile(track)?.let { return DspTrack(it, wave) } }
         val target = paths(track)
         val previous = paths(track, "analysis-wave-v4")
         for (entry in listOf(target, previous)) {
             val json = readJson(entry.waveform, WAVEFORM_CACHE_BYTES) ?: continue
             val profile = readProfile(json["analysis"] as? JsonObject) ?: continue
             val wave = readWaveform(json) ?: continue
-            return DspTrack(profile, wave)
+            val current = synchronized(profiles) { profiles.getOrPut(track) { profile } }
+            waveforms[track] = wave
+            return DspTrack(current, wave)
         }
         val profile = cachedProfile(track) ?: analyze(track)
         val waveform = DspAnalysis.waveform(DspPcm.read(ffmpeg(), track.path.toString(), 16_000, 1))
@@ -90,23 +113,121 @@ internal class DspTrackCache(private val directory: Path, private val ffmpeg: ()
             put("mid", waveform.mid.json())
             put("high", waveform.high.json())
         })
+        waveforms[track] = waveform
         return DspTrack(profile, waveform)
     }
 
-    private fun analyze(source: Source): DspProfile {
-        val profile = DspAnalysis.profile(DspPcm.read(ffmpeg(), source.path.toString(), 22_050, 1))
+    fun mix(path: String): Pair<DspProfile, DspMixFeatures> {
+        val track = source(path)
+        val existing = cachedProfile(track)
+        val target = mixPath(track, MIX_VERSION)
+        if (existing != null) {
+            val stored = synchronized(mixFeatures) { mixFeatures[track] }?.takeIf { it.loudness100ms != null }
+                ?: readMix(target, existing, withLoudness = true)
+            if (stored != null) {
+                synchronized(mixFeatures) { mixFeatures[track] = stored }
+                return existing to stored
+            }
+        }
+        val samples = decodeProfile(track)
+        val profile = existing ?: analyze(track, samples)
+        val features = DspMixAnalysis.extract(samples, profile)
+        writeAtomic(track, target) { temp ->
+            DataOutputStream(Files.newOutputStream(temp).buffered()).use { output ->
+                output.writeInt(features.times.size)
+                output.writeDouble(features.audibleStart)
+                output.writeDouble(features.audibleEnd)
+                features.times.forEach(output::writeDouble)
+                features.descriptors.forEach(output::writeFloat)
+                features.boundaries.forEach(output::writeFloat)
+                features.drops.forEach(output::writeFloat)
+                val levels = checkNotNull(features.loudness100ms)
+                output.writeInt(levels.size)
+                levels.forEach(output::writeFloat)
+            }
+        }
+        synchronized(mixFeatures) { mixFeatures[track] = features }
+        return profile to features
+    }
+
+    fun cachedMix(path: String): Pair<DspProfile, DspMixFeatures?>? {
+        val track = try {
+            source(path)
+        } catch (_: IOException) {
+            return null
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        val profile = cachedProfile(track) ?: return null
+        val features = synchronized(mixFeatures) { mixFeatures[track] }
+            ?: readMix(mixPath(track, MIX_VERSION), profile, withLoudness = true)
+            ?: readMix(mixPath(track, "mix-features-v1"), profile, withLoudness = false)
+        if (features != null) synchronized(mixFeatures) { mixFeatures[track] = features }
+        return profile to features
+    }
+
+    private fun mixPath(source: Source, version: String) = directory.resolve("${source.key(version)}.mix")
+
+    private fun readMix(path: Path, profile: DspProfile, withLoudness: Boolean): DspMixFeatures? {
+        return try {
+            checkDspInterrupted()
+            val bytes = Files.size(path)
+            if (bytes > 1024 * 1024) return null
+            DataInputStream(Files.newInputStream(path).buffered()).use { input ->
+                val count = input.readInt()
+                val width = DspMixFeatures.WIDTH
+                if (count !in 1..4501) return null
+                val baseBytes = 20L + count * (8 + 4 * (width + 2))
+                if (withLoudness && bytes < baseBytes + 8 || !withLoudness && bytes != baseBytes) return null
+                val first = input.readDouble()
+                val last = input.readDouble()
+                if (first !in 0.0..profile.duration || last !in first..profile.duration) return null
+                val times = DoubleArray(count) { input.readDouble() }
+                if (times.indices.any { times[it] !in 0.0..profile.duration ||
+                        it > 0 && times[it] <= times[it - 1] }) return null
+                if (profile.beats.size >= 2 && !profile.beats.contentEquals(times)) return null
+                fun values(size: Int) = FloatArray(size) { input.readFloat().also { require(it in 0f..1.001f) } }
+                val descriptors = values(count * width)
+                val boundaries = values(count)
+                val drops = values(count)
+                val levels = if (withLoudness) {
+                    val size = input.readInt()
+                    if (size !in 1..(DspPcm.TRACK_LIMIT_SECONDS * 10 + 1) || bytes != baseBytes + 4 + size * 4L ||
+                        kotlin.math.abs(size - profile.duration * 10) > 1.02) return null
+                    FloatArray(size) { input.readFloat().also { require(it in -125f..48f) } }
+                } else null
+                DspMixFeatures(times, descriptors, boundaries, drops, first, last, levels)
+            }
+        } catch (_: IOException) {
+            checkDspInterrupted()
+            null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
+    private fun decodeProfile(source: Source) = DspPcm.read(ffmpeg(), source.path.toString(), 22_050, 1)
+
+    private fun analyze(source: Source, samples: FloatArray = decodeProfile(source)): DspProfile {
+        val profile = DspAnalysis.profile(samples)
         require(profile.duration > 0.0) { "未解码出可分析的音频" }
         write(source, paths(source).profile, profile.json())
+        synchronized(profiles) { profiles[source] = profile }
         return profile
     }
 
-    private fun write(track: Source, path: Path, value: JsonObject) {
+    private fun write(track: Source, path: Path, value: JsonObject) =
+        writeAtomic(track, path) { Files.writeString(it, value.toString()) }
+
+    private fun writeAtomic(track: Source, path: Path, fill: (Path) -> Unit) {
         if (Thread.interrupted()) throw InterruptedException()
         require(source(track.path.toString()) == track) { "分析期间音频文件已改变" }
         Files.createDirectories(directory)
         val temporary = Files.createTempFile(directory, "analysis-", ".tmp")
         try {
-            Files.writeString(temporary, value.toString())
+            fill(temporary)
+            checkDspInterrupted()
+            require(source(track.path.toString()) == track) { "分析期间音频文件已改变" }
             try {
                 Files.move(temporary, path, ATOMIC_MOVE, REPLACE_EXISTING)
             } catch (_: AtomicMoveNotSupportedException) {
@@ -202,6 +323,7 @@ internal class DspTrackCache(private val directory: Path, private val ffmpeg: ()
     }
 
     private companion object {
+        const val MIX_VERSION = "mix-features-v2"
         const val PROFILE_CACHE_BYTES = 512 * 1024
         const val WAVEFORM_CACHE_BYTES = 2 * 1024 * 1024
         // Retain valid larger legacy entries while bounding parsed arrays before reusing them.

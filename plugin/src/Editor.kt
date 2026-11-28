@@ -329,26 +329,37 @@ internal data class PairAnalysisSnapshot(
     val reasons: List<String>
 )
 
+internal data class PairSnapshotKey(val pair: String, val pathA: String, val pathB: String, val mode: MixAlgorithm)
+
+internal data class EditorPair(
+    val outgoing: MediaItem?,
+    val incoming: MediaItem?,
+    val rowKeys: Pair<String, String>? = null
+) {
+    companion object {
+        fun displayed(queue: QueueView, pinned: EditorPair?) =
+            pinned ?: EditorPair(queue.nextPair?.first, queue.nextPair?.second)
+    }
+}
+
 internal class AutoMixUiCache {
     var library: List<MediaItem> = emptyList()
     var queue: QueueView = QueueView()
     var playlists: List<SpwPlaylist> = emptyList()
     var selectedPlaylistId: String? = null
-    var selectedA: MediaItem? = null
-    var selectedB: MediaItem? = null
-    var selectedPairKeys: Pair<String, String>? = null
+    var pinnedPair: EditorPair? = null
     var playlistTab: String = "queue"
     var initialized: Boolean = false
     var queueScrolledToCurrent: Boolean = false
     val covers = PlaylistCoverStore()
     val trackMetadata = mutableStateMapOf<String, TrackAnalysisMetadata>()
-    val pairCache = object : LinkedHashMap<String, PairAnalysisSnapshot>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PairAnalysisSnapshot>) = size > 12
+    val pairCache = object : LinkedHashMap<PairSnapshotKey, PairAnalysisSnapshot>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<PairSnapshotKey, PairAnalysisSnapshot>) = size > 12
     }
     val editHistories = mutableMapOf<String, TransitionEditHistory>()
 }
 
-private val transitionLengths = linkedMapOf(2 to "2 小节", 4 to "4 小节", 8 to "8 小节")
+private val transitionLengths = linkedMapOf(1 to "1 小节", 2 to "2 小节", 4 to "4 小节", 8 to "8 小节")
 
 @Composable
 private fun SaltCard(content: @Composable ColumnScope.() -> Unit) {
@@ -641,12 +652,6 @@ internal data class SpwPlaylistTrack(
     val rowKey: String = syncTrackId
 )
 internal data class PlaylistMember(val syncTrackId: String, val path: String?)
-
-internal enum class PlaylistScanMode(val label: String, val description: String, val suffix: String?) {
-    Matched("挑歌并新建", "只留下适合衔接的歌", "精选"),
-    All("全单重排并新建", "保留原歌单的每首歌", "全部"),
-    ScanOnly("仅扫描", "分析歌曲并保留结果", null)
-}
 
 private val playlistCoverSize = 38.dp
 private val playlistTrackHeight = 56.dp
@@ -1758,9 +1763,10 @@ private fun DeckStage(
                     )
                     .clickable {
                         val nextBars = when (curPlan.bars) {
+                            1 -> 2
                             2 -> 4
                             4 -> 8
-                            else -> 2
+                            else -> 1
                         }
                         onUpdate(curPlan.withBars(nextBars, lengthA, lengthB))
                     }
@@ -1903,6 +1909,8 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
     ) {
     CompositionLocalProvider(LocalSkin provides skin) {
         val cache = plugin.uiCache
+        val algorithm by plugin.algorithm.collectAsState()
+        var algorithmNote by remember { mutableStateOf("") }
         val pageEntering = LocalAutoMixPageEntering.current
         val pageClosing = LocalAutoMixPageClosing.current
         val canCommitState by rememberUpdatedState(!pageEntering && !pageClosing)
@@ -1916,10 +1924,12 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
         var playlistNote by remember { mutableStateOf("") }
         var scanJob by remember { mutableStateOf<Job?>(null) }
         var scanProgress by remember { mutableStateOf<Pair<Int, Int>?>(null) }
-        var writingPlaylist by remember { mutableStateOf(false) }
+        var scanningQueue by remember { mutableStateOf(false) }
+        var applyingQueueOrder by remember { mutableStateOf(false) }
         var scanNote by remember { mutableStateOf("") }
-        var a by remember(cache) { mutableStateOf(cache.selectedA) }
-        var b by remember(cache) { mutableStateOf(cache.selectedB) }
+        var pinnedPair by remember(cache) { mutableStateOf(cache.pinnedPair) }
+        val following = pinnedPair == null
+        val (a, b, selectedPairKeys) = EditorPair.displayed(queue, pinnedPair)
         var playlistTab by remember(cache) { mutableStateOf(cache.playlistTab) }
         val queueScroll = rememberLazyListState()
         val playlistScroll = if (playlistTab == "queue") queueScroll else key(
@@ -1935,15 +1945,13 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
         var refreshing by remember(cache) { mutableStateOf(!cache.initialized) }
         var movingQueue by remember { mutableStateOf(false) }
         var movingPlaylist by remember { mutableStateOf(false) }
-        var selectedPairKeys by remember(cache) { mutableStateOf(cache.selectedPairKeys) }
+        fun showPair(selection: EditorPair?) {
+            pinnedPair = selection
+            cache.pinnedPair = selection
+        }
 
         fun selectPair(pair: Pair<MediaItem, MediaItem>, keys: Pair<String, String>? = null) {
-            a = pair.first
-            b = pair.second
-            selectedPairKeys = keys
-            cache.selectedA = pair.first
-            cache.selectedB = pair.second
-            cache.selectedPairKeys = keys
+            showPair(EditorPair(pair.first, pair.second, keys))
         }
 
         fun selectTab(tab: String) {
@@ -2003,43 +2011,19 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        suspend fun refreshLists(selectInitialPair: Boolean, deferCommit: Boolean = false) {
+        suspend fun refreshLists(deferCommit: Boolean = false) {
             if (!cache.initialized || !deferCommit) refreshing = true
             try {
-                val bridge = host
-                val fetched = withContext(Dispatchers.IO) {
-                    val tracks = WorkshopApi.library.getAllTracks().toCompletableFuture().get()
+                val tracks = withContext(Dispatchers.IO) {
+                    WorkshopApi.library.getAllTracks().toCompletableFuture().get()
                         .filter { it.path.isNotBlank() && it.id.isNotBlank() }
-                    val nextQueue = bridge?.let { it.queueView(it.queueStates().value, tracks) }
-                    val nextPlaylists = bridge?.let { runCatching { buildSpwPlaylists(it, tracks) } }
-                    Triple(tracks, nextQueue, nextPlaylists)
                 }
                 if (deferCommit) awaitMotionSettled()
-                val (tracks, nextQueue, nextPlaylists) = fetched
                 library = tracks
                 cache.library = tracks
                 cache.initialized = true
-                if (nextQueue != null) {
-                    queue = nextQueue
-                    cache.queue = nextQueue
-                    if (selectInitialPair && a == null && b == null) nextQueue.nextPair?.let { selectPair(it) }
-                }
                 message = if (tracks.size < 2) "曲库不足两首歌曲" else ""
-                if (nextPlaylists != null) {
-                    nextPlaylists.onSuccess { parsed ->
-                        playlists = parsed
-                        cache.playlists = parsed
-                        if (selectedPlaylistId == null || parsed.none { it.id == selectedPlaylistId }) {
-                            val nextId = (parsed.firstOrNull { it.tracks.size >= 2 } ?: parsed.firstOrNull())?.id
-                            selectedPlaylistId = nextId
-                            cache.selectedPlaylistId = nextId
-                        }
-                        playlistNote = ""
-                    }.onFailure { err ->
-                        if (err is CancellationException) throw err
-                        playlistNote = err.message ?: "读取歌单失败"
-                    }
-                }
+                loadSpwPlaylists(tracks)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 message = "读取曲库失败，请检查曲库读取权限"
@@ -2048,15 +2032,19 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        LaunchedEffect(plugin, host) { refreshLists(selectInitialPair = true, deferCommit = true) }
+        LaunchedEffect(plugin, host) { refreshLists(deferCommit = true) }
 
         LaunchedEffect(host, library) {
             val bridge = host ?: return@LaunchedEffect
-            bridge.queueStates().collect { state ->
+            val states = bridge.queueStates()
+            states.collect { state ->
                 val next = withContext(Dispatchers.Default) { bridge.queueView(state, library) }
                 awaitMotionSettled()
-                queue = next
-                cache.queue = next
+                // The state can advance while mapping the library or waiting for the page animation.
+                if (states.value == state) {
+                    queue = next
+                    cache.queue = next
+                }
             }
         }
 
@@ -2127,7 +2115,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
 
         fun handleMoveQueue(fromIdx: Int, toIdx: Int, onRejected: () -> Unit = {}) {
             val bridge = plugin.bridge
-            if (bridge == null || movingQueue || fromIdx !in queueEntries.indices ||
+            if (bridge == null || movingQueue || scanningQueue || fromIdx !in queueEntries.indices ||
                 toIdx !in queueEntries.indices || fromIdx == toIdx) {
                 onRejected()
                 return
@@ -2141,7 +2129,6 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                 var confirmed = false
                 try {
                     confirmed = bridge.moveQueueItem(order, from, to)
-                    queue = bridge.queueView(bridge.queueStates().value, library)
                     if (confirmed) bridge.rescheduleAutomix()
                     queueNote = if (confirmed) "已同步 SPW 播放队列顺序" else "队列顺序未确认，请刷新后重试"
                 } catch (e: Exception) {
@@ -2201,68 +2188,63 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             }
         }
 
-        fun runPlaylistAction(source: SpwPlaylist, mode: PlaylistScanMode) {
+        fun scanTracks(paths: List<String?>, queueOrder: QueueOrder? = null) {
+            if (scanJob != null) return
             val bridge = plugin.bridge
-            val nameSuffix = mode.suffix
-            if (scanJob != null || source.tracks.size < 2) return
-            if (nameSuffix != null && bridge?.canCreatePlaylists != true) return
-            val total = source.members.size
-            val paths = source.members.map { it.path }
-            scanNote = ""
+            val scanAlgorithm = algorithm
+            val total = paths.size
+            scanningQueue = queueOrder != null
+            if (scanningQueue) queueNote = "" else scanNote = ""
             scanProgress = 0 to total
+            fun report(text: String) {
+                if (queueOrder == null) scanNote = text else queueNote = text
+            }
             val job = scope.launch(start = CoroutineStart.LAZY) {
                 try {
-                    val scan = plugin.worker.scanPlaylist(paths) { done ->
+                    val scan = plugin.worker.scanPlaylist(paths, scanAlgorithm) { done ->
                         scanProgress = done to total
                     }
                     metadataRevision++
                     if (scan.analyzed == 0) {
-                        scanNote = listOfNotNull("没有可分析的歌曲", scan.firstTrackError).joinToString(" · ")
+                        report(listOfNotNull("没有可分析的歌曲", scan.firstTrackError).joinToString(" · "))
                         return@launch
                     }
-                    if (nameSuffix == null) {
-                        scanNote = "扫描完成 · 已分析 ${scan.analyzed}/$total 首" +
-                            if (scan.analyzed < total) " · ${total - scan.analyzed} 首无法分析" else ""
+                    if (queueOrder == null) {
+                        report("扫描完成 · 已分析 ${scan.analyzed}/$total 首" +
+                            if (scan.analyzed < total) " · ${total - scan.analyzed} 首无法分析" else "")
                         return@launch
                     }
-                    val result = plugin.worker.sequencePlaylist(paths)
-                    if (result.analyzed == 0) {
-                        scanNote = "扫描后歌曲文件已变化，请重新扫描"
+
+                    val anchored = queueOrder.fixedPrefix > 0
+                    val result = plugin.worker.sequenceTracks(paths, scanAlgorithm, anchorFirst = anchored)
+                    if (result.analyzed < 2) {
+                        report("可分析的歌曲不足两首")
                         return@launch
                     }
-                    val indices = if (mode == PlaylistScanMode.Matched) result.matched else result.all
-                    if (indices.size < 2) {
-                        scanNote = "未找到可连续匹配的曲目，可选择「${PlaylistScanMode.All.label}」"
-                        return@launch
+                    val fixed = queueOrder.fixedPrefix
+                    val offset = (fixed - 1).coerceAtLeast(0)
+                    val target = queueOrder.ids.take(fixed) + result.all.map { it + offset }
+                        .filter { it >= fixed }.map { queueOrder.ids[it] }
+                    ensureActive()
+                    applyingQueueOrder = true
+                    val outcome = withContext(NonCancellable + Dispatchers.IO) {
+                        checkNotNull(bridge).reorderUpcoming(queueOrder, target)
                     }
-                    val baseName = "${source.title} · AutoMix $nameSuffix"
-                    val existingNames = playlists.mapTo(mutableSetOf()) { it.title }
-                    var title = baseName
-                    var suffix = 2
-                    while (title in existingNames) title = "$baseName (${suffix++})"
-                    writingPlaylist = true
-                    val id = withContext(Dispatchers.IO) {
-                        checkNotNull(bridge).createPlaylist(source.id, title, indices.map { source.members[it].syncTrackId })
-                    }
-                    loadSpwPlaylists(library)
-                    if (playlists.any { it.id == id }) {
-                        selectedPlaylistId = id
-                        cache.selectedPlaylistId = id
-                    }
-                    val details = buildList {
-                        add("已创建「$title」 · ${indices.size}/$total 首")
-                        if (mode == PlaylistScanMode.All && result.weakLinks > 0) add("${result.weakLinks} 处衔接较弱")
-                        if (result.analyzed < total) add("${total - result.analyzed} 首未分析")
-                    }
-                    scanNote = details.joinToString(" · ")
+                    report(when {
+                        !outcome.complete && outcome.moves > 0 -> "宿主队列已变化，已停止重排 · 已确认 ${outcome.moves} 次移动"
+                        !outcome.complete -> "宿主队列已变化，请重新重排"
+                        outcome.moves == 0 -> "当前队列已是推荐顺序"
+                        else -> "已重排接下来 ${target.size - fixed} 首歌曲"
+                    })
                 } catch (e: CancellationException) {
-                    scanNote = "扫描已取消"
+                    if (!applyingQueueOrder) report("扫描已取消")
                     throw e
                 } catch (e: Exception) {
-                    val error = if (nameSuffix == null) "扫描失败" else "自动歌单生成失败"
-                    scanNote = "$error · ${e.cause?.message ?: e.message ?: e.javaClass.simpleName}"
+                    val error = if (queueOrder == null) "扫描失败" else "队列重排失败"
+                    report("$error · ${e.cause?.message ?: e.message ?: e.javaClass.simpleName}")
                 } finally {
-                    writingPlaylist = false
+                    applyingQueueOrder = false
+                    scanningQueue = false
                     scanProgress = null
                     scanJob = null
                 }
@@ -2271,11 +2253,21 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
             job.start()
         }
 
+        fun reorderUpcomingQueue() {
+            if (movingQueue || refreshing || plugin.bridge?.canReorderQueue != true) return
+            val snapshot = QueueOrder(queue.order, queue.currentIndex, queue.shuffled)
+            if (snapshot.shuffled || snapshot.ids.size - snapshot.fixedPrefix < 2) return
+            val pathsById = queue.entries.associate { it.queueId to it.item.path }
+            val keys = snapshot.ids.drop((snapshot.fixedPrefix - 1).coerceAtLeast(0))
+            scanTracks(keys.map(pathsById::get), snapshot)
+        }
+
         fun playFromList(action: (HostPlayback) -> Unit) {
             val bridge = plugin.bridge ?: return
             try {
                 plugin.worker.stopPreview()
                 action(bridge)
+                showPair(null)
             } catch (e: Exception) {
                 val reason = e.cause?.message ?: e.message ?: "宿主播放接口不可用"
                 WorkshopApi.ui.toast("播放歌曲失败 · $reason", WorkshopApi.Ui.ToastType.Error)
@@ -2685,7 +2677,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
 
         @Composable
         fun PlaylistPanel(modifier: Modifier = Modifier) {
-            val curQueueIdx = queueEntries.indexOfFirst { it.rawIndex == queue.currentIndex }
+            val curQueueIdx = queueEntries.indexOfFirst { it.displayIndex == queue.currentIndex }
             LaunchedEffect(playlistTab, curQueueIdx, pageEntering) {
                 if (playlistTab == "queue" && curQueueIdx >= 0 && !pageEntering && !cache.queueScrolledToCurrent) {
                     cache.queueScrolledToCurrent = true
@@ -2694,8 +2686,8 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                 }
             }
             val hasQueueWrap = queueEntries.size > 1 &&
-                queueEntries.first().rawIndex == 0 &&
-                queueEntries.last().rawIndex == queue.order.lastIndex &&
+                queueEntries.first().displayIndex == 0 &&
+                queueEntries.last().displayIndex == queue.order.lastIndex &&
                 queueEntries.last().item.id != queueEntries.first().item.id &&
                 queue.currentIndex == queue.order.lastIndex &&
                 queue.nextPair?.let { it.first.id == queueEntries.last().item.id && it.second.id == queueEntries.first().item.id } == true
@@ -2705,7 +2697,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                         "当前 ${queue.currentIndex + 1}/${queue.order.size}"
                     } else "${queue.order.size} 首队列"
                     val adjacentSaved = queueTracks.zipWithNext().withIndex().count { (idx, pair) ->
-                        queueEntries[idx].rawIndex + 1 == queueEntries[idx + 1].rawIndex &&
+                        queueEntries[idx].displayIndex + 1 == queueEntries[idx + 1].displayIndex &&
                             pairKey(pair.first.id, pair.second.id) in savedPlans
                     }
                     val wrapSaved = if (hasQueueWrap && pairKey(queueTracks.last().id, queueTracks.first().id) in savedPlans) 1 else 0
@@ -2736,54 +2728,72 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             overflow = TextOverflow.Ellipsis
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Chip("当前转场", compact = true, quiet = true, enabled = curQueueIdx >= 0 || queue.nextPair != null) {
+                            Chip(if (following) "跟随播放" else "当前转场", compact = true, quiet = true, selected = following) {
+                                showPair(null)
                                 selectTab("queue")
-                                val nextPair = queue.nextPair
-                                if (nextPair != null) {
-                                    selectPair(nextPair)
-                                    queueNote = ""
-                                    // The queue status above the tracks occupies the first list item.
-                                    if (curQueueIdx >= 0) queueScroll.requestScrollToItem(curQueueIdx + 1)
-                                } else {
-                                    queueNote = queue.nextPairNote
-                                    queueScroll.requestScrollToItem(0)
-                                }
+                                queueNote = ""
+                                // The queue status above the tracks occupies the first list item.
+                                queueScroll.requestScrollToItem(if (curQueueIdx >= 0) curQueueIdx + 1 else 0)
                             }
                             MaterialSymbolButton(MaterialSymbol.Refresh, enabled = !refreshing && !movingQueue && !movingPlaylist && scanJob == null) {
                                 refreshing = true
                                 queueNote = ""
                                 scope.launch {
-                                    refreshLists(selectInitialPair = false)
+                                    refreshLists()
                                     metadataRevision++
                                 }
                             }
                         }
                     }
                     SegmentedTabs(
+                        options = MixAlgorithm.entries.map { it.name to it.label },
+                        selected = algorithm.name
+                    ) { name ->
+                        algorithmNote = runCatching { plugin.selectAlgorithm(MixAlgorithm.valueOf(name)) }
+                            .exceptionOrNull()?.message.orEmpty()
+                    }
+                    if (algorithmNote.isNotEmpty()) Label(algorithmNote, small = true)
+                    SegmentedTabs(
                         options = listOf("queue" to "队列", "playlists" to "歌单", "saved" to "已保存", "custom" to "自选"),
                         selected = playlistTab,
                         onSelect = ::selectTab
                     )
                     cardSummary?.let { Label(it, small = true) }
+                    if (playlistTab == "queue") {
+                        if (scanningQueue) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                val progress = if (applyingQueueOrder) "正在同步队列…" else scanProgress
+                                    ?.let { (done, total) -> "扫描 $done/$total" }.orEmpty()
+                                Label(progress, small = true)
+                                if (!applyingQueueOrder) Chip("取消", compact = true) { scanJob?.cancel() }
+                            }
+                        } else {
+                            val fixed = (queue.currentIndex + 1).coerceIn(0, queue.order.size)
+                            Chip(
+                                "智能重排", primary = true, compact = true,
+                                enabled = host?.canReorderQueue == true && !queue.shuffled && !refreshing &&
+                                    !movingQueue && scanJob == null && queue.order.size - fixed >= 2,
+                                click = ::reorderUpcomingQueue
+                            )
+                        }
+                    }
                     if (playlistTab == "playlists") {
                         val pl = activePlaylist
-                        val canCreate = plugin.bridge?.canCreatePlaylists == true
                         if (playlists.isNotEmpty()) {
                             PlaylistToolbar(
                                 playlists = playlists,
                                 current = pl,
                                 canPick = scanJob == null && !movingPlaylist,
                                 canScan = !refreshing && !movingPlaylist && scanJob == null && (pl?.tracks?.size ?: 0) >= 2,
-                                canGenerate = canCreate && (pl?.tracks?.size ?: 0) >= 2,
-                                activity = if (writingPlaylist) "创建中…" else scanProgress?.let { (done, total) -> "扫描 $done/$total" },
-                                onCancel = if (scanJob != null && !writingPlaylist) ({ scanJob?.cancel() }) else null,
+                                activity = scanProgress?.takeUnless { scanningQueue }?.let { (done, total) -> "扫描 $done/$total" },
+                                onCancel = if (scanJob != null && !scanningQueue) ({ scanJob?.cancel() }) else null,
                                 onPick = {
                                     selectedPlaylistId = it.id
                                     cache.selectedPlaylistId = it.id
                                     scanNote = ""
                                     playlistNote = ""
                                 },
-                                onAction = { mode -> pl?.let { runPlaylistAction(it, mode) } }
+                                onScan = { pl?.let { scanTracks(it.members.map(PlaylistMember::path)) } }
                             )
                         }
                         val note = when {
@@ -2791,7 +2801,6 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                             playlistNote.isNotBlank() -> playlistNote
                             playlists.isEmpty() -> "未读取到 SPW 歌单，可点击刷新"
                             pl != null && pl.tracks.size < 2 -> "编辑转场需要至少两首本地歌曲"
-                            pl != null && pl.members.size >= 2 && !canCreate -> "当前 SPW 版本的自动新建歌单接口不可用"
                             pl != null && pl.tracks.size != pl.members.size -> "含未匹配本地曲目，暂不支持调序"
                             else -> null
                         }
@@ -2804,7 +2813,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                 val rowDrag = remember(playlistScroll) { PlaylistRowDrag() }
                 val queueKeys = remember(queueEntries) { queueEntries.map { it.queueId.toString() } }
                 val playlistKeys = remember(activePlaylist) { activePlaylist?.tracks?.map { it.rowKey }.orEmpty() }
-                val canMoveQueue = !movingQueue && !refreshing
+                val canMoveQueue = !queue.shuffled && !movingQueue && !refreshing && !scanningQueue
                 val canReorderPlaylist = activePlaylist?.let {
                     host?.canReorderPlaylists == true && it.tracks.size == it.members.size
                 } == true
@@ -2827,6 +2836,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                         "queue" -> {
                             item("queue-header") {
                                 Column(Modifier.padding(bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    if (queue.shuffled) Label("随机播放顺序 · 关闭随机播放后可调序", small = true)
                                     Label(queue.nextPairNote, small = true)
                                     if (queueNote.isNotBlank() && queueNote != queue.nextPairNote) Label(queueNote, small = true)
                                     if (queueTracks.isEmpty() && queue.order.isNotEmpty()) {
@@ -2838,11 +2848,11 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                 tracks = queueTracks,
                                 rowKeys = queueKeys,
                                 drag = rowDrag,
-                                rowNumbers = queueEntries.map { it.rawIndex + 1 },
+                                rowNumbers = queueEntries.map { it.displayIndex + 1 },
                                 currentTrackIndex = curQueueIdx,
-                                canReorder = true,
+                                canReorder = !queue.shuffled,
                                 moveEnabled = canMoveQueue,
-                                isAdjacent = { i -> queueEntries[i].rawIndex + 1 == queueEntries[i + 1].rawIndex },
+                                isAdjacent = { i -> queueEntries[i].displayIndex + 1 == queueEntries[i + 1].displayIndex },
                                 wrapAround = hasQueueWrap,
                                 onPlay = if (host?.canPlayTracks == true) { index ->
                                     playFromList { it.playQueueTrack(queueEntries[index]) }
@@ -2894,16 +2904,10 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
                                     InlinePicker(library.filter { it.id != b?.id }, "A · 退出曲", a) {
-                                        a = it
-                                        selectedPairKeys = null
-                                        cache.selectedA = it
-                                        cache.selectedPairKeys = null
+                                        showPair(EditorPair(it, b))
                                     }
                                     InlinePicker(library.filter { it.id != a?.id }, "B · 进入曲", b) {
-                                        b = it
-                                        selectedPairKeys = null
-                                        cache.selectedB = it
-                                        cache.selectedPairKeys = null
+                                        showPair(EditorPair(a, it))
                                     }
                                 }
                             } else {
@@ -2931,6 +2935,7 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                 trackMetadata[bb.path]?.let(from::tempoPair)
                             },
                             savedPlan = savedPlans[pairKey(aa.id, bb.id)],
+                            algorithm = algorithm,
                             onBack = onBack,
                             onTrackAnalyzed = { path, metadata -> trackMetadata[path] = metadata },
                             playlistPanel = { PlaylistPanel(playlistModifier) }
@@ -2952,7 +2957,8 @@ internal fun NativeEditor(plugin: MainPlugin, skin: Skin, onBack: (() -> Unit)? 
                                         .padding(start = 20.dp, end = 10.dp, top = 8.dp, bottom = 20.dp),
                                     verticalArrangement = Arrangement.spacedBy(12.dp)
                                 ) {
-                                    SaltCard { Label(message.ifBlank { "选择当前转场，或从右侧选择一组歌曲" }, small = true) }
+                                    val emptyNote = if (following) queue.nextPairNote else "从右侧选齐两首歌后即可编辑转场"
+                                    SaltCard { Label(message.ifBlank { emptyNote }, small = true) }
                                 }
                             }
                             PlaylistPanel(playlistModifier)
@@ -2974,6 +2980,7 @@ private fun PairWorkspace(
     covers: PlaylistCoverStore,
     tempoPair: String?,
     savedPlan: Plan?,
+    algorithm: MixAlgorithm,
     onBack: (() -> Unit)?,
     onTrackAnalyzed: (String, TrackAnalysisMetadata) -> Unit,
     playlistPanel: @Composable () -> Unit
@@ -2991,15 +2998,14 @@ private fun PairWorkspace(
     val history = remember(plugin.uiCache, planKey) {
         plugin.uiCache.editHistories[planKey] ?: TransitionEditHistory()
     }
-    val cachedPair = remember(plugin.uiCache, planKey) {
-        synchronized(plugin.uiCache.pairCache) { plugin.uiCache.pairCache[planKey] }
-    }
-    var analyzing by remember(planKey) { mutableStateOf(cachedPair == null) }
+    val snapshotKey = PairSnapshotKey(planKey, a.path, b.path, algorithm)
+    val cachedPair = remember(plugin.uiCache, snapshotKey) { plugin.uiCache.pairCache[snapshotKey] }
+    var analyzing by remember(snapshotKey) { mutableStateOf(cachedPair == null) }
     var rendering by remember { mutableStateOf(false) }
     var waveA by remember(planKey) { mutableStateOf(cachedPair?.waveA) }
     var waveB by remember(planKey) { mutableStateOf(cachedPair?.waveB) }
-    var autoPlan by remember(planKey) { mutableStateOf(cachedPair?.autoPlan) }
-    var reasons by remember(planKey) { mutableStateOf(cachedPair?.reasons.orEmpty()) }
+    var autoPlan by remember(snapshotKey) { mutableStateOf(cachedPair?.autoPlan) }
+    var reasons by remember(snapshotKey) { mutableStateOf(cachedPair?.reasons.orEmpty()) }
     var openParam by remember { mutableStateOf<TransitionParameter?>(null) }
     var hoveredPlan by remember { mutableStateOf<Plan?>(null) }
     var showReasons by remember { mutableStateOf(false) }
@@ -3064,12 +3070,17 @@ private fun PairWorkspace(
         }
     }
 
-    LaunchedEffect(a.id, b.id) {
-        if (cachedPair != null) return@LaunchedEffect
-        analyzing = true
-        status = "正在自动分析双轨…"
+    LaunchedEffect(snapshotKey) {
+        task?.cancel()
+        plugin.worker.stopPreview()
+        rendering = false
+        isPlaying = false
+        playheadSec = null
+        hoveredPlan = null
+        analyzing = cachedPair == null
+        status = if (analyzing) "正在自动分析双轨…" else idleStatus
         try {
-            val data = plugin.worker.analyzePair(a.path, b.path)
+            val data = plugin.worker.analyzePair(a.path, b.path, algorithm)
             fun DspTrack.metadata() = TrackAnalysisMetadata(profile.bpm, profile.keyName, profile.camelot)
             fun DspTrack.displayWave(metadata: TrackAnalysisMetadata): TrackWaves {
                 return TrackWaves(
@@ -3089,8 +3100,8 @@ private fun PairWorkspace(
             val nextWaveA = data.a.displayWave(metadataA)
             val nextWaveB = data.b.displayWave(metadataB)
             val snapshot = PairAnalysisSnapshot(nextWaveA, nextWaveB, data.recommendation.plan, data.recommendation.reasons)
-            synchronized(plugin.uiCache.pairCache) { plugin.uiCache.pairCache[planKey] = snapshot }
             if (!canCommitState) snapshotFlow { canCommitState }.first { it }
+            plugin.uiCache.pairCache[snapshotKey] = snapshot
             waveA = nextWaveA
             waveB = nextWaveB
             autoPlan = snapshot.autoPlan
