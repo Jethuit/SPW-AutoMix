@@ -181,6 +181,23 @@ internal object DspAnalysis {
         return Loudness(asLufs(if (relativeCount == 0) absoluteMean else relativeSum / relativeCount), sections)
     }
 
+    // 100 ms K-weighted blocks keep quiet intros and reverb tails visible to the planner.
+    fun transitionLoudness(samples: FloatArray): FloatArray {
+        val block = PROFILE_RATE / 10
+        val filtered = Filter(kWeight)
+        return FloatArray((samples.size + block - 1) / block) { index ->
+            checkDspInterrupted()
+            val start = index * block
+            val end = minOf(start + block, samples.size)
+            var power = 0.0
+            for (i in start until end) {
+                val value = filtered.next(samples[i].toDouble())
+                power += 2.0 * value * value
+            }
+            asLufs(power / (end - start)).coerceIn(-125.0, 48.0).toFloat()
+        }
+    }
+
     private fun asLufs(energy: Double) = roundToScale(-0.691 + 10.0 * log10(energy + 1e-12), 100.0)
 
     private data class SpectralFeatures(val kick: DoubleArray, val snare: DoubleArray, val lowRatio: DoubleArray)

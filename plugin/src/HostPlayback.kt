@@ -6,6 +6,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn
@@ -13,7 +14,7 @@ import kotlin.math.*
 
 internal data class QueueTrackEntry(
     val item: MediaItem,
-    val rawIndex: Int,
+    val displayIndex: Int,
     val queueId: Int,
     val sourceId: String?,
     val sourcePath: String?
@@ -24,7 +25,8 @@ internal data class QueueView(
     val order: List<Int> = emptyList(),
     val currentIndex: Int = -1,
     val nextPair: Pair<MediaItem, MediaItem>? = null,
-    val nextPairNote: String = "当前没有可编辑的下一首"
+    val nextPairNote: String = "当前没有可编辑的下一首",
+    val shuffled: Boolean = false
 )
 
 internal data class PlaybackTrack(val id: String, val path: String)
@@ -33,21 +35,21 @@ internal data class UpcomingTransition(val from: PlaybackTrack, val to: Playback
     val key = pairKey(from.id, to.id)
 }
 
-internal data class PreparedAutoMix(val key: String, val plan: Plan)
+internal data class PreparedAutoMix(val key: String, val plan: Plan, val algorithm: MixAlgorithm)
 
 internal class HostPlayback(symbols: HostSymbols) {
     private val mix = runCatching { HostMixTargets(symbols) }
     private val queue = runCatching { HostQueueTargets(symbols) }
+    private val queueEdits = Mutex()
     private val trackPlayback = runCatching { HostTrackPlayback(symbols) }
     private val playlist = runCatching { HostPlaylistTargets(symbols) }
     private val playlistReader = runCatching { HostPlaylistReader(symbols) }
-    private val playlistCreation = runCatching { HostPlaylistCreation(symbols) }
     private val reschedule = runCatching { HostRescheduleTargets(symbols) }
     val liveHighPass = MutableStateFlow(false)
     val planner get() = mix.getOrThrow().planner
     val canPlayTracks get() = trackPlayback.isSuccess
     val canReorderPlaylists get() = playlist.isSuccess
-    val canCreatePlaylists get() = playlistCreation.isSuccess
+    val canReorderQueue get() = queue.isSuccess
     val warnings = listOf("过渡" to mix, "队列" to queue, "歌单读取" to playlistReader,
         "歌单排序" to playlist, "立即重排过渡" to reschedule)
         .mapNotNull { (role, result) -> result.exceptionOrNull()?.let { "$role · ${it.message ?: it.javaClass.simpleName}" } }
@@ -84,17 +86,33 @@ internal class HostPlayback(symbols: HostSymbols) {
         if (state == null) return null
         return runCatching { with(targets) {
             val selection = selection(state, normalQueue.get(state) as List<*>)
-            fun trackAt(index: Int): PlaybackTrack? {
-                val item = selection.items.getOrNull(index) ?: return null
-                val media = queueMedia.get(item) ?: return null
-                val id = mediaId.get(media) as? String ?: return null
-                val path = mediaPath.get(media) as? String ?: return null
-                return PlaybackTrack(id, path).takeIf { id.isNotBlank() && path.isNotBlank() }
-            }
-            val a = trackAt(selection.current) ?: return@runCatching null
-            val b = trackAt(selection.next) ?: return@runCatching null
+            val a = playbackTrack(selection.items.getOrNull(selection.current)) ?: return@runCatching null
+            val b = playbackTrack(selection.items.getOrNull(selection.next)) ?: return@runCatching null
             UpcomingTransition(a, b).takeIf { a.id != b.id }
         } }.getOrNull()
+    }
+
+    private fun HostQueueTargets.playbackTrack(item: Any?): PlaybackTrack? {
+        val media = item?.let(queueMedia::get) ?: return null
+        val id = mediaId.get(media) as? String ?: return null
+        val path = mediaPath.get(media) as? String ?: return null
+        return PlaybackTrack(id, path).takeIf { id.isNotBlank() && path.isNotBlank() }
+    }
+
+    fun followingTracks(state: Any?, count: Int): List<PlaybackTrack> {
+        val targets = queue.getOrNull() ?: return emptyList()
+        if (state == null) return emptyList()
+        return runCatching { with(targets) {
+            val selection = selection(state, normalQueue.get(state) as List<*>)
+            if (selection.next < 0) return@runCatching emptyList()
+            val result = ArrayList<PlaybackTrack>(count)
+            for (offset in 0 until minOf(count, selection.items.size - 1)) {
+                val index = selection.next + offset
+                val slot = if (selection.mode == "Circle") index % selection.items.size else index
+                selection.items.getOrNull(slot)?.let { playbackTrack(it) }?.let(result::add)
+            }
+            result.distinctBy(PlaybackTrack::path)
+        } }.getOrDefault(emptyList())
     }
 
     fun queueView(state: Any?, library: List<MediaItem>): QueueView {
@@ -102,8 +120,8 @@ internal class HostPlayback(symbols: HostSymbols) {
         if (state == null) return QueueView(nextPairNote = "播放队列为空")
         return runCatching { with(targets) {
             val raw = normalQueue.get(state) as List<*>
-            val order = raw.map { queueItemId.getInt(it) }
             val selection = selection(state, raw)
+            val order = selection.items.map { queueItemId.getInt(it) }
 
             val byId = library.associateBy { it.id }
             val byPath = library.associateBy { normPath(it.path) }
@@ -118,16 +136,14 @@ internal class HostPlayback(symbols: HostSymbols) {
                     } else null
             }
 
-            val entries = raw.mapIndexedNotNull { idx, qItem ->
+            val entries = selection.items.mapIndexedNotNull { idx, qItem ->
                 val media = qItem?.let(queueMedia::get) ?: return@mapIndexedNotNull null
                 val id = mediaId.get(media) as? String
                 val path = mediaPath.get(media) as? String
                 resolve(media, id, path)?.let { QueueTrackEntry(it, idx, order[idx], id, path) }
             }
             val isRandom = selection.mode == "Random"
-            val currentIndex = if (isRandom) {
-                selection.items.getOrNull(selection.current)?.let { order.indexOf(queueItemId.getInt(it)) } ?: -1
-            } else selection.current
+            val currentIndex = selection.current
             val byQueueId = entries.associateBy { it.queueId }
             fun itemAt(index: Int) = selection.items.getOrNull(index)
                 ?.let { byQueueId[queueItemId.getInt(it)]?.item }
@@ -142,7 +158,7 @@ internal class HostPlayback(symbols: HostSymbols) {
                 pair == null -> "当前歌曲和下一首是同一首"
                 else -> "当前转场 · ${a.title} → ${b.title}"
             }
-            QueueView(entries, order, currentIndex, pair, note)
+            QueueView(entries, order, currentIndex, pair, note, shuffled = isRandom)
         } }.getOrElse { e ->
             QueueView(nextPairNote = "队列读取失败 · ${e.cause?.javaClass?.simpleName ?: e.javaClass.simpleName}")
         }
@@ -150,26 +166,49 @@ internal class HostPlayback(symbols: HostSymbols) {
 
     fun playQueueTrack(entry: QueueTrackEntry) {
         val targets = queue.getOrThrow()
-        val index = targets.states().value?.let { targets.playbackIndex(it, entry) }
+        val (index, shuffled) = targets.states().value?.let { targets.playbackIndex(it, entry) }
             ?: error("该歌曲已不在当前队列，请刷新后重试")
-        trackPlayback.getOrThrow().playQueueIndex(index)
+        trackPlayback.getOrThrow().playQueueIndex(index, shuffled)
     }
 
     fun playPlaylistTrack(tracks: List<MediaItem>, index: Int) =
         trackPlayback.getOrThrow().playPlaylist(tracks, index)
 
-    suspend fun moveQueueItem(order: List<Int>, from: QueueTrackEntry, to: QueueTrackEntry): Boolean {
-        val targets = queue.getOrNull() ?: return false
+    private suspend fun <T> withQueueEdit(edit: suspend () -> T): T {
+        queueEdits.lock()
+        try {
+            return edit()
+        } finally {
+            queueEdits.unlock()
+        }
+    }
+
+    suspend fun moveQueueItem(order: List<Int>, from: QueueTrackEntry, to: QueueTrackEntry): Boolean = withQueueEdit {
+        val targets = queue.getOrNull() ?: return@withQueueEdit false
         val states = targets.states()
-        val current = states.value ?: return false
-        if (targets.order(current) != order || order.getOrNull(from.rawIndex) != from.queueId ||
-            order.getOrNull(to.rawIndex) != to.queueId) return false
-        val expected = order.toMutableList().apply { add(to.rawIndex, removeAt(from.rawIndex)) }
-        targets.move(from.rawIndex, to.rawIndex)
-        return withTimeoutOrNull(2000L) {
+        val current = states.value ?: return@withQueueEdit false
+        if (targets.isShuffled(current) || targets.order(current) != order ||
+            order.getOrNull(from.displayIndex) != from.queueId || order.getOrNull(to.displayIndex) != to.queueId) return@withQueueEdit false
+        val expected = order.toMutableList().apply { add(to.displayIndex, removeAt(from.displayIndex)) }
+        targets.move(from.displayIndex, to.displayIndex)
+        withTimeoutOrNull(2000L) {
             val updated = states.first { it != null && targets.order(it) != order }
             updated != null && targets.order(updated) == expected
         } == true
+    }
+
+    suspend fun reorderUpcoming(initial: QueueOrder, target: List<Int>): QueueReorderOutcome = withQueueEdit {
+        val targets = queue.getOrNull() ?: return@withQueueEdit QueueReorderOutcome(false, 0)
+        val states = targets.states()
+        fun snapshot(value: Any?): QueueOrder? = value?.let {
+            QueueOrder(targets.order(it), targets.normalIndex.getInt(it), targets.isShuffled(it))
+        }
+        applyUpcomingQueueOrder(initial, target, { snapshot(states.value) }) { before, from, to ->
+            targets.move(from, to)
+            withTimeoutOrNull(2000L) {
+                snapshot(states.first { snapshot(it) != before })
+            }
+        }
     }
 
     /** Persist custom playlist track order back to SPW's native PlaylistRepository and switch sort to Custom ascending. */
@@ -196,9 +235,6 @@ internal class HostPlayback(symbols: HostSymbols) {
             Result.failure(e.cause ?: e)
         }
     }
-
-    suspend fun createPlaylist(sourceId: String, title: String, orderedSyncTrackIds: List<String>): String =
-        playlistCreation.getOrThrow().create(sourceId, title, orderedSyncTrackIds)
 
     suspend fun loadPlaylists(): List<HostPlaylist> = playlistReader.getOrThrow().read()
 
@@ -252,6 +288,7 @@ internal class HostPlayback(symbols: HostSymbols) {
         val shortLimit = bpmA?.let { (480000.0 / it).roundToLong() } ?: 3000L
         val spectralOK = spectral.invoke(call.args[4], "spectral_automation") == true
         val keepGapless = preservesGapless(call.args.getOrNull(5))
+        if (savedPlan == null && automatic?.algorithm == MixAlgorithm.Spotify && !nativeActive && keepGapless) return null
 
         fun install(
             transitionMode: String, start: Long, entry: Long, lengthMs: Long, gains: List<Any>,

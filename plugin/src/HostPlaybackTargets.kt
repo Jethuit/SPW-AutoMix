@@ -145,11 +145,15 @@ internal class HostQueueTargets(symbols: HostSymbols) {
     fun move(from: Int, to: Int) { move.invoke(instance.get(null), from, to) }
     fun order(state: Any): List<Int> = (normalQueue.get(state) as List<*>).map(queueItemId::getInt)
 
-    fun playbackIndex(state: Any, entry: QueueTrackEntry): Int? {
-        val items = normalQueue.get(state) as List<*>
+    fun isShuffled(state: Any) = (queueMode.get(state) as Enum<*>).name == "Random"
+
+    fun playbackIndex(state: Any, entry: QueueTrackEntry): Pair<Int, Boolean>? {
+        val shuffled = isShuffled(state)
+        val items = (if (shuffled) randomQueue else normalQueue).get(state) as List<*>
         val index = items.indexOfFirst { it != null && queueItemId.getInt(it) == entry.queueId }
         val media = items.getOrNull(index)?.let(queueMedia::get) ?: return null
         return index.takeIf { mediaId.get(media) == entry.sourceId && mediaPath.get(media) == entry.sourcePath }
+            ?.let { it to shuffled }
     }
 }
 
@@ -167,9 +171,8 @@ internal class HostTrackPlayback(symbols: HostSymbols) {
         mediaType.constructorProperties("id", "title", "artist", "album", "albumArtist", "path")
     }
 
-    fun playQueueIndex(index: Int) {
-        // The sidebar shows normal queue order even when playback is shuffled.
-        playAt.invoke(instance.get(null), index, false)
+    fun playQueueIndex(index: Int, shuffled: Boolean) {
+        playAt.invoke(instance.get(null), index, shuffled)
     }
 
     fun playPlaylist(tracks: List<MediaItem>, index: Int) {

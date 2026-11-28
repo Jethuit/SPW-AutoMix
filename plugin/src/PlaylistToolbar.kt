@@ -50,23 +50,20 @@ import com.moriafly.salt.ui.popup.PopupMenuDefaults
 import com.moriafly.salt.ui.popup.PopupMenuMaterial
 import kotlinx.coroutines.launch
 
-private enum class PlaylistToolbarMenu { Playlists, Mix }
-
 @Composable
 internal fun PlaylistToolbar(
     playlists: List<SpwPlaylist>,
     current: SpwPlaylist?,
     canPick: Boolean,
     canScan: Boolean,
-    canGenerate: Boolean,
     activity: String?,
     onCancel: (() -> Unit)?,
     onPick: (SpwPlaylist) -> Unit,
-    onAction: (PlaylistScanMode) -> Unit
+    onScan: () -> Unit
 ) {
-    var openMenu by remember { mutableStateOf<PlaylistToolbarMenu?>(null) }
+    var pickerOpen by remember { mutableStateOf(false) }
     val pageClosing = LocalAutoMixPageClosing.current
-    LaunchedEffect(pageClosing) { if (pageClosing) openMenu = null }
+    LaunchedEffect(pageClosing) { if (pageClosing) pickerOpen = false }
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -74,7 +71,7 @@ internal fun PlaylistToolbar(
     ) {
         var playlistAnchorBounds by remember { mutableStateOf<Rect?>(null) }
         Box(Modifier.weight(1f).onGloballyPositioned { playlistAnchorBounds = it.boundsInWindow() }) {
-            val expanded = !pageClosing && openMenu == PlaylistToolbarMenu.Playlists && canPick
+            val expanded = !pageClosing && pickerOpen && canPick
             ToolbarButton(
                 title = current?.title ?: "选择歌单",
                 detail = current?.let { "${it.members.size} 首" },
@@ -83,38 +80,19 @@ internal fun PlaylistToolbar(
                 dropdown = true,
                 expanded = expanded,
                 description = "切换歌单"
-            ) { openMenu = if (expanded) null else PlaylistToolbarMenu.Playlists }
+            ) { pickerOpen = !expanded }
             if (expanded) {
-                PlaylistPickerPopup(playlists, current, playlistAnchorBounds, onDismiss = { openMenu = null }) {
-                    openMenu = null
+                PlaylistPickerPopup(playlists, current, playlistAnchorBounds, onDismiss = { pickerOpen = false }) {
+                    pickerOpen = false
                     onPick(it)
                 }
             }
         }
-        Box {
-            val expanded = !pageClosing && openMenu == PlaylistToolbarMenu.Mix && canScan && activity == null
-            ToolbarButton(
-                title = activity ?: "生成混音",
-                enabled = canScan && activity == null,
-                primary = activity == null,
-                dropdown = activity == null,
-                expanded = expanded
-            ) { openMenu = if (expanded) null else PlaylistToolbarMenu.Mix }
-            if (expanded) {
-                ToolbarPopup(156.dp, onDismiss = { openMenu = null }) {
-                    for (mode in PlaylistScanMode.entries) {
-                        ToolbarOption(
-                            mode.label,
-                            description = mode.description,
-                            enabled = mode == PlaylistScanMode.ScanOnly || canGenerate
-                        ) {
-                            openMenu = null
-                            onAction(mode)
-                        }
-                    }
-                }
-            }
-        }
+        ToolbarButton(
+            title = activity ?: "仅扫描",
+            enabled = canScan && activity == null,
+            onClick = onScan
+        )
         if (onCancel != null) {
             ToolbarButton("取消", description = "取消扫描", onClick = onCancel)
         }
@@ -127,7 +105,6 @@ private fun ToolbarButton(
     detail: String? = null,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    primary: Boolean = false,
     dropdown: Boolean = false,
     expanded: Boolean = false,
     description: String? = null,
@@ -137,12 +114,7 @@ private fun ToolbarButton(
     val colors = SaltTheme.colors
     val subStyle = SaltTheme.textStyles.sub
     var hovered by remember { mutableStateOf(false) }
-    val filled = primary && enabled
-    val text = when {
-        filled -> colors.onHighlight
-        enabled -> colors.text
-        else -> colors.subText
-    }
+    val text = if (enabled) colors.text else colors.subText
     BasicButton(
         onClick = onClick,
         modifier = modifier
@@ -155,7 +127,6 @@ private fun ToolbarButton(
         shape = SaltTheme.shapes.small,
         colors = ButtonColors(
             containerColor = when {
-                filled -> colors.highlight
                 hovered && enabled -> skin.hover
                 else -> colors.background
             },
@@ -163,7 +134,7 @@ private fun ToolbarButton(
             disabledContainerColor = colors.background,
             disabledContentColor = colors.subText
         ),
-        border = if (expanded && !filled) BorderStroke(1.dp, SolidColor(colors.highlight.copy(alpha = 0.65f))) else null,
+        border = if (expanded) BorderStroke(1.dp, SolidColor(colors.highlight.copy(alpha = 0.65f))) else null,
         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp)
     ) {
         Row(

@@ -56,6 +56,15 @@ internal enum class FilterSweep(val lowPass: Boolean, private val strength: Doub
     }
 }
 
+// The skew puts equal deck power at the chosen handoff without a kink at that point.
+internal fun incomingMixPower(phase: Double, pivot: Double, focused: Boolean): Double {
+    val t = phase.coerceIn(0.0, 1.0)
+    val center = pivot.coerceIn(0.05, 0.95)
+    val numerator = t * (1.0 - center)
+    val skewed = numerator / (numerator + (1.0 - t) * center)
+    return smoothstep(if (focused) (skewed - 0.22) / 0.56 else skewed)
+}
+
 private fun smoothstep(u: Double): Double {
     val t = u.coerceIn(0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
@@ -149,7 +158,7 @@ internal data class TransitionWindow(
         }
         when (plan.volume) {
             "mid-cut" -> densify(pivot - cutWidth / 2.0, pivot + cutWidth / 2.0)
-            "overlap" -> knots += pivot
+            "overlap", "mix-power", "mix-handoff" -> knots += pivot
             "full-overlap" -> {
                 densify(0.0, startEdge)
                 densify(endEdgeStart, 1.0)
@@ -172,6 +181,10 @@ internal data class TransitionWindow(
             if (u - result.last().first < 1e-5 || u > 1.0 - 1e-5) continue
             val (a, b) = when (plan.volume) {
                 "linear" -> (1.0 - u) to u
+                "mix-power", "mix-handoff" -> {
+                    val incoming = incomingMixPower(u, pivot, plan.volume == "mix-handoff")
+                    sqrt(1.0 - incoming) to sqrt(incoming)
+                }
                 "full-overlap" -> (1.0 - cosineEase((u - endEdgeStart) / endEdge)) to cosineEase(u / startEdge)
                 "fade-cut" -> (1.0 - cosineEase((u - endEdgeStart) / endEdge)) to min(1.0, u / pivot)
                 "cut-fade" -> min(1.0, (1.0 - u) / (1.0 - pivot)) to sin(PI / 2.0 * min(1.0, u / startEdge))
@@ -229,7 +242,7 @@ internal data class Plan(
     val usesSwap: Boolean
         get() = !useHost && !noMix && (
             eq in listOf("bass-swap", "fast-bass-cut", "bass-cut-fast", "bass-cut-long", "three-band") ||
-                volume in listOf("overlap", "mid-cut", "fade-cut", "cut-fade") ||
+                volume in listOf("overlap", "mid-cut", "fade-cut", "cut-fade", "mix-power", "mix-handoff") ||
                 filterSweep(0) != null ||
                 filterSweep(1) != null
             )
@@ -292,7 +305,7 @@ internal data class Plan(
 
     fun valid() = listOf(cueA, cueB, bpmA, bpmB, swap).all { it.isFinite() } &&
         cueA >= 0.0 && bpmA in 30.0..300.0 && bpmB in 30.0..300.0 &&
-        bars in listOf(2, 4, 8) && (volume in volumes || noMix) && eq in eqs && filter in filters &&
+        bars in listOf(1, 2, 4, 8) && (volume in volumes || noMix) && eq in eqs && filter in filters &&
         swap in .05.. .95
 
     fun window(lengthA: Long, lengthB: Long): TransitionWindow? {
@@ -409,6 +422,8 @@ internal data class Plan(
         )
         val volumes = linkedMapOf(
             "smooth" to "流畅",
+            "mix-power" to "等功率淡化",
+            "mix-handoff" to "集中交接",
             "full-overlap" to "重叠",
             "overlap" to "淡入淡出",
             "fade-cut" to "淡入切出",

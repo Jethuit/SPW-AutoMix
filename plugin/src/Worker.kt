@@ -68,6 +68,16 @@ internal class Worker(
     }
     private val tracks = DspTrackCache(cache) { ffmpeg }
 
+    private data class RecommendationKey(
+        val a: DspProfile, val b: DspProfile, val algorithm: MixAlgorithm,
+        val featuresA: DspMixFeatures?, val featuresB: DspMixFeatures?
+    )
+
+    // Accessed under requests. Profile identities change when a source file changes.
+    private val recommendations = object : LinkedHashMap<RecommendationKey, DspRecommendation>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<RecommendationKey, DspRecommendation>) = size > 12
+    }
+
     private data class PreviewKey(val a: String, val b: String, val plan: Plan, val window: TransitionWindow)
 
     private var cachedKey: PreviewKey? = null
@@ -151,30 +161,61 @@ internal class Worker(
         }
     }
 
-    suspend fun planPair(a: String, b: String): Plan = runInterruptible(Dispatchers.IO) {
-        process { recommend(tracks.profile(a), tracks.profile(b)).plan }
+    suspend fun planPair(a: String, b: String, algorithm: MixAlgorithm): Plan = runInterruptible(Dispatchers.IO) {
+        process { recommend(a, b, algorithm).plan }
     }
 
-    suspend fun analyzePair(a: String, b: String): PairAnalysis = runInterruptible(Dispatchers.IO) {
+    suspend fun analyzePair(a: String, b: String, algorithm: MixAlgorithm): PairAnalysis = runInterruptible(Dispatchers.IO) {
         process {
-            val first = tracks.track(a)
-            val second = tracks.track(b)
-            PairAnalysis(first, second, recommend(first.profile, second.profile))
+            val recommendation = recommend(a, b, algorithm)
+            PairAnalysis(tracks.track(a), tracks.track(b), recommendation)
         }
     }
 
-    private fun recommend(a: DspProfile, b: DspProfile) = DspPlanning.transition(a, b).also {
-        check(it.plan.valid()) { "自动过渡参数无效" }
+    private fun recommend(a: String, b: String, algorithm: MixAlgorithm): DspRecommendation {
+        val (first, featuresA) = profile(a, algorithm)
+        val (second, featuresB) = profile(b, algorithm)
+        val key = RecommendationKey(first, second, algorithm, featuresA, featuresB)
+        return recommendations.getOrPut(key) {
+            val result = if (algorithm == MixAlgorithm.Spotify) {
+                SpotifyMixPlanning.transition(first, second, featuresA, featuresB)
+            } else {
+                DspPlanning.transition(first, second)
+            }
+            check(result.plan.valid()) { "自动过渡参数无效" }
+            result
+        }
     }
 
-    suspend fun scanPlaylist(paths: List<String?>, onProgress: (Int) -> Unit): PlaylistScanResult {
+    private fun profile(path: String, algorithm: MixAlgorithm): Pair<DspProfile, DspMixFeatures?> {
+        if (algorithm == MixAlgorithm.Original) return tracks.profile(path) to null
+        return try {
+            tracks.mix(path)
+        } catch (e: IOException) {
+            checkDspInterrupted()
+            if (e is AudioRuntimeException) throw e
+            tracks.cachedMix(path) ?: throw e
+        } catch (e: IllegalArgumentException) {
+            // An older, longer track can still supply tempo and cues when a new decode exceeds the limit.
+            tracks.cachedMix(path) ?: throw e
+        }
+    }
+
+    suspend fun preAnalyze(path: String, algorithm: MixAlgorithm) = runInterruptible(Dispatchers.IO) {
+        process { profile(path, algorithm) }
+        Unit
+    }
+
+    suspend fun scanPlaylist(
+        paths: List<String?>, algorithm: MixAlgorithm, onProgress: (Int) -> Unit
+    ): PlaylistScanResult {
         var firstError: String? = null
         var analyzed = 0
         for ((index, path) in paths.withIndex()) {
             coroutineContext.ensureActive()
             if (path != null) {
                 try {
-                    runInterruptible(Dispatchers.IO) { process { tracks.profile(path) } }
+                    runInterruptible(Dispatchers.IO) { process { profile(path, algorithm) } }
                     analyzed++
                 } catch (e: IOException) {
                     coroutineContext.ensureActive()
@@ -189,9 +230,20 @@ internal class Worker(
         return PlaylistScanResult(analyzed, firstError)
     }
 
-    suspend fun sequencePlaylist(paths: List<String?>): PlaylistSequenceResult {
+    suspend fun sequenceTracks(paths: List<String?>, algorithm: MixAlgorithm, anchorFirst: Boolean): PlaylistSequenceResult {
         val result = runInterruptible(Dispatchers.IO) {
-            process { DspPlanning.sequence(paths.map { it?.let(tracks::cachedProfile) }) }
+            process {
+                if (algorithm == MixAlgorithm.Spotify) {
+                    val input = paths.mapIndexed { index, path ->
+                        path?.let(tracks::cachedMix)?.let { (profile, features) ->
+                            SpotifyMixPlanning.sequenceTrack(index, profile, features)
+                        }
+                    }
+                    SpotifyMixPlanning.sequence(input, anchorFirst)
+                } else {
+                    DspPlanning.sequence(paths.map { it?.let(tracks::cachedProfile) })
+                }
+            }
         }
         check(result.all.size == paths.size && result.all.toSet() == paths.indices.toSet() &&
             result.matched.distinct().size == result.matched.size &&
