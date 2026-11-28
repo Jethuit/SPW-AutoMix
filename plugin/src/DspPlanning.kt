@@ -143,8 +143,9 @@ internal object DspPlanning {
         return DspRecommendation(plan, reasons)
     }
 
-    fun sequence(profiles: List<DspProfile?>): PlaylistSequenceResult {
+    fun sequence(profiles: List<DspProfile?>, anchorFirst: Boolean = false): PlaylistSequenceResult {
         val tracks = profiles.map { it?.let(::sequenceTrack) }
+        val anchor = 0.takeIf { anchorFirst && tracks.isNotEmpty() }
         val tempos = tracks.indices.filter { tracks[it]?.reliable == true }
             .sortedWith(compareBy({ requireNotNull(tracks[it]).bpm }, { it }))
         val edges = buildList {
@@ -175,8 +176,10 @@ internal object DspPlanning {
             return i
         }
 
-        for (edge in edges.sortedWith(compareBy(Edge::cost, Edge::from, Edge::to))) {
-            if (next[edge.from] >= 0 || hasPrevious[edge.to]) continue
+        // Reserve the anchor's best successor before linking the rest of the queue.
+        val edgeOrder = compareBy<Edge>({ it.from != anchor }, Edge::cost, Edge::from, Edge::to)
+        for (edge in edges.sortedWith(edgeOrder)) {
+            if (edge.to == anchor || next[edge.from] >= 0 || hasPrevious[edge.to]) continue
             val first = root(edge.from)
             val second = root(edge.to)
             if (first == second) continue
@@ -199,7 +202,14 @@ internal object DspPlanning {
         }
         val matched = chains.minWithOrNull(compareBy({ -it.indices.size }, Chain::cost, { it.indices.first() }))
             ?.indices?.takeIf { it.size >= 2 }.orEmpty()
-        val ordered = chains.flatMap(Chain::indices) + tracks.indices.filter { tracks[it]?.reliable != true }
+        val anchoredChain = chains.firstOrNull { it.indices.first() == anchor }
+        val ordered = buildList {
+            if (anchor != null) addAll(anchoredChain?.indices ?: listOf(anchor))
+            for (chain in chains) {
+                if (chain !== anchoredChain) addAll(chain.indices)
+            }
+            addAll(tracks.indices.filter { it != anchor && tracks[it]?.reliable != true })
+        }
         val weakLinks = ordered.zipWithNext().count { (from, to) ->
             val a = tracks[from]
             val b = tracks[to]

@@ -241,7 +241,7 @@ internal class Worker(
                     }
                     SpotifyMixPlanning.sequence(input, anchorFirst)
                 } else {
-                    DspPlanning.sequence(paths.map { it?.let(tracks::cachedProfile) })
+                    DspPlanning.sequence(paths.map { it?.let(tracks::cachedProfile) }, anchorFirst)
                 }
             }
         }

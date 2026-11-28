@@ -49,6 +49,7 @@ fun main(args: Array<String>) {
     check(SpotifyMixPlanning.sequence(emptyList()).weakLinks == 0)
     val anchored = SpotifyMixPlanning.sequence(input, anchorFirst = true)
     check(anchored.all.first() == 0 && anchored.all.sorted() == input.indices.toList())
+    checkOriginalQueueAnchor()
     checkQueueReordering()
     println("PASS harmonic sequencing, duplicate tracks, and unavailable entries")
 
@@ -119,6 +120,23 @@ private fun checkQuietProgramAndGainCurves() {
     }
     check(overlap("mix-handoff") < overlap("mix-power"))
     println("PASS short-term analysis recognizes quiet audio, and automatic envelopes retain mix power")
+}
+
+private fun checkOriginalQueueAnchor() {
+    val current = fixture(129.0, "9B").first.copy(lufs2s = DoubleArray(60) { if (it >= 52) -2.0 else -14.0 })
+    val upcoming = listOf(120.0, 123.0, 126.0).map { fixture(it, "9B").first }
+    val profiles = listOf(current) + upcoming
+
+    val unanchored = DspPlanning.sequence(profiles)
+    check(unanchored.all == listOf(1, 2, 3, 0)) { unanchored }
+    val anchored = DspPlanning.sequence(profiles, anchorFirst = true)
+    check(anchored.all == listOf(0, 3, 2, 1) && anchored.weakLinks == 0) { anchored }
+
+    for (unavailable in listOf(null, current.copy(bpmConfidence = 0.1))) {
+        val result = DspPlanning.sequence(listOf(unavailable) + upcoming, anchorFirst = true)
+        check(result.all.first() == 0 && result.all.sorted() == profiles.indices.toList()) { result }
+    }
+    println("PASS original queue sequencing optimizes the first transition from the playing track")
 }
 
 private fun checkQueueReordering() = runBlocking {
